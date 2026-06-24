@@ -1,0 +1,12 @@
+/*
+ * parse.h — top-level parser interface.
+ */
+#ifndef CC_PARSE_H
+#define CC_PARSE_H
+
+#include "cc.h"
+#include "lexer.h"
+
+void parse_translation_unit(lexer_t *lx);
+
+#endif /* CC_PARSE_H */

@@ -1,0 +1,121 @@
+OnyxCC — Release Package
+========================
+
+C/C++ → RISC-V64 → .onx компилятор для OnyxOS.
+Написан на чистом C, GPLv3, MVP готов.
+
+СОДЕРЖИМОЕ АРХИВА
+-----------------
+
+  onyxcc                      Linux x86_64 ELF (335 KB)
+                              ─ запуск на dev-машине для компиляции C
+                                программ в .onx, не требует установки.
+
+  onyxcc.riscv.elf            RISC-V64 ELF (40 KB)
+                              ─ промежуточный артефакт сборки.
+
+  onyxcc.onx                  OnyxOS ring-1 бинарник (40 KB)
+                              ─ drop into OnyxFS, запускается прямо на
+                                OnyxOS. PID 1 может spawn-уть его как
+                                root-сервис.
+
+  tests/hello_full.onx        Hello world (1.4 KB)
+                              ─ runnable .onx, выводит "Hello, OnyxOS!"
+                                через SYS_write. Скомпилирован нашим
+                                onyxcc.
+
+ИСХОДНИКИ
+---------
+
+  src/                        ~3000 строк C (компилятор)
+    main.c                    CLI driver
+    util.c                    Диагностика, арена, буферы
+    lexer.c                   Лексер C99
+    pp.c                      Препроцессор
+    types.c                   Система типов
+    ast.c                     AST + symbol table
+    parse.c                   Top-level парсер
+    gen.c                     Single-pass парсер выражений + RISC-V codegen
+    riscv64.c                 Кодирование инструкций RV64IMA
+    emit.c                    .onx v1 writer
+    shim.c                    Freestanding libc shim (для OnyxOS сборки)
+
+  include/                    Заголовки
+    onx.h                     .onx формат (синхронизирован с OnyxKernel)
+    syscalls.h                OnyxOS syscall ABI
+    cc.h, lexer.h, pp.h, types.h, ast.h, parse.h, gen.h, riscv64.h, emit.h
+    compat.h                  Portability layer (Linux vs OnyxOS freestanding)
+
+  libonyxc/                   Минимальная libc для OnyxOS userspace
+    include/                  stdio.h, stdlib.h, string.h, ctype.h, onyxc.h, ...
+    src/
+      start.c                 _start → main → exit
+      syscalls.c              Обёртки над ecall
+      stdio.c                 printf/puts/putchar
+      stdlib.c                malloc/sbrk/exit/atoi/strtol
+      string.c                strlen/strcpy/strcmp/...
+      ctype.c                 isalpha/isdigit/...
+
+  linker_onyx.ld              Linker script для OnyxOS-сборки (text@0x10000)
+
+  Makefile                    make / make hello / make onyxcc-riscv /
+                              make onyxcc-onx / make all-targets / make clean
+
+  scripts/                    Вспомогательные скрипты
+    fetch_qemu_libs.sh        Скачать libc-зависимости qemu (для dev-машины)
+    create_bootimg.sh         Создать OnyxFS disk image для QEMU теста
+
+  tests/
+    hello_full.c              Тестовый C-код (самодостаточный, с _start + syscalls)
+    hello_full.onx            Скомпилированный .onx
+
+ИСПОЛЬЗОВАНИЕ
+-------------
+
+1. На Linux (dev-машина, без OnyxOS):
+
+     ./onyxcc -o hello.onx tests/hello_full.c
+
+   Доп. опции:
+     -I <path>     добавить include path
+     -D NAME=val   предопределить макрос
+     -e <symbol>   entry symbol (по умолчанию _start)
+     --ring1       генерировать ring-1 бинарник (root space)
+     -v            verbose
+
+2. На OnyxOS (полу-self-hosting):
+
+   Скопировать onyxcc.onx в /bin/onyxcc, запускать из shell.
+   Внимание: текущая MVP-версия может не собрать весь свой собственный
+   исходник — не хватает switch/case, goto, полной variadic support.
+   Roadmap: v0.2 = full self-hosting.
+
+3. Сборка из исходников:
+
+   Linux-версия:
+     make                # → ./onyxcc
+
+   OnyxOS-версия (нужен clang-19 + lld-19 + elf2onx из OnyxKernel):
+     make onyxcc-onx     # → onyxcc.onx
+
+ПОДДЕРЖКА OnyxKernel
+--------------------
+
+Этот релиз совместим с OnyxKernel v0.3 (формат .onx v1, 31 syscall,
+ring-модель 0/1/2). Тесты валидации:
+- onyxcc_compat.rs — парсит hello_full.onx через OnyxHeader::from_bytes()
+- onyxcc_self.rs   — парсит onyxcc.onx
+
+Оба теста проходят с OnyxKernel/core/tests/.
+
+ЛИЦЕНЗИЯ
+--------
+
+GPLv3, в соответствии с лицензией всего проекта OnyxOS.
+
+ССЫЛКИ
+------
+
+- OnyxOS:     https://github.com/loki5512344/OnyxOS
+- OnyxBoot:   https://github.com/loki5512344/OnyxBoot
+- OnyxKernel: https://github.com/loki5512344/OnyxKernel
