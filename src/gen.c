@@ -54,6 +54,76 @@ static val_t parse_expr(lexer_t *lx);
 static void parse_stmt(lexer_t *lx);
 static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
+static void patch_jal(uint32_t off, int32_t delta);
+static void patch_sd_imm(uint32_t off, int32_t imm);
+
+/* ---- Label table for goto/label ------------------------------------- */
+#define MAX_LABELS 256
+#define MAX_PATCHES 256
+
+typedef struct {
+    char name[CC_MAX_IDENT];
+    uint32_t offset;
+    uint32_t patches[MAX_PATCHES];
+    int n_patches;
+} label_t;
+
+static label_t g_labels[MAX_LABELS];
+static int g_n_labels;
+
+static void label_clear(void) {
+    g_n_labels = 0;
+}
+
+static int label_find_or_add(const char *name) {
+    for (int i = 0; i < g_n_labels; i++) {
+        if (strcmp(g_labels[i].name, name) == 0) return i;
+    }
+    if (g_n_labels >= MAX_LABELS) cc_fatal("too many labels");
+    int idx = g_n_labels++;
+    strncpy(g_labels[idx].name, name, CC_MAX_IDENT - 1);
+    g_labels[idx].name[CC_MAX_IDENT - 1] = 0;
+    g_labels[idx].offset = 0;
+    g_labels[idx].n_patches = 0;
+    return idx;
+}
+
+static void label_define(const char *name) {
+    int idx = label_find_or_add(name);
+    label_t *l = &g_labels[idx];
+    if (l->offset != 0) {
+        cc_error("duplicate label '%s'", name);
+        return;
+    }
+    l->offset = (uint32_t)g_text.size;
+    for (int i = 0; i < l->n_patches; i++) {
+        int32_t delta = (int32_t)l->offset - (int32_t)l->patches[i];
+        patch_jal(l->patches[i], delta);
+    }
+    l->n_patches = 0;
+}
+
+static void label_emit_jump(const char *name) {
+    int idx = label_find_or_add(name);
+    label_t *l = &g_labels[idx];
+    uint32_t patch_off = (uint32_t)g_text.size;
+    rv_jal(RV_ZERO, 0);
+    if (l->offset != 0) {
+        int32_t delta = (int32_t)l->offset - (int32_t)patch_off;
+        patch_jal(patch_off, delta);
+    } else {
+        if (l->n_patches >= MAX_PATCHES) cc_fatal("too many jumps to label");
+        l->patches[l->n_patches++] = patch_off;
+    }
+}
+
+static void label_check_unresolved(void) {
+    for (int i = 0; i < g_n_labels; i++) {
+        if (g_labels[i].offset == 0 && g_labels[i].n_patches > 0) {
+            cc_error("undefined label '%s'", g_labels[i].name);
+        }
+    }
+}
 
 /* ---- Helpers --------------------------------------------------------- */
 static int alloc_int_reg(void) {
@@ -127,6 +197,44 @@ static void load_value(val_t *v, int reg) {
         v->kind = VAL_REG;
         v->offset = 0;
     }
+}
+
+/* ---- Branch/jump patching helpers ----------------------------------- */
+static void patch_branch(uint32_t off, int32_t delta) {
+    uint8_t *p = g_text.data + off;
+    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    insn |= ((uint32_t)(delta & 0x1000) << 19) |
+            ((uint32_t)(delta & 0x7E0) << 20) |
+            ((uint32_t)(delta & 0x1E) << 7)  |
+            ((uint32_t)(delta & 0x800) >> 4);
+    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
+}
+
+static void patch_jal(uint32_t off, int32_t delta) {
+    uint8_t *p = g_text.data + off;
+    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    insn &= ~0xFFFFF000;
+    insn |= ((uint32_t)(delta & 0x100000) << 11) |
+            ((uint32_t)(delta & 0x7FE) << 20) |
+            ((uint32_t)(delta & 0x800) << 9)  |
+            ((uint32_t)(delta & 0xFF000));
+    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
+}
+
+static void patch_sd_imm(uint32_t off, int32_t imm) {
+    uint8_t *p = g_text.data + off;
+    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    insn &= ~0xFE000F80;
+    uint32_t imm_lo = (uint32_t)(imm & 0x1F);
+    uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
+    insn |= (imm_hi << 25) | (imm_lo << 7);
+    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
 }
 
 /* ---- Type parsing ---------------------------------------------------- */
@@ -604,6 +712,64 @@ static val_t parse_primary(lexer_t *lx) {
                     r.reg = RV_A0;
                     r.type = &ty_long;
                     return r;
+                }
+                if (strcmp(name, "va_start") == 0 || strcmp(name, "__builtin_va_start") == 0) {
+                    /* va_start(ap, last) — `last` is ignored */
+                    parse_expect(T_LPAREN, "expected '('");
+                    val_t ap = parse_assign(lx);
+                    if (strcmp(name, "va_start") == 0) {
+                        parse_expect(T_COMMA, "expected ','");
+                        parse_assign(lx);
+                    }
+                    parse_expect(T_RPAREN, "expected ')'");
+                    materialize(&ap, RV_T0);
+                    if (!g_func.is_variadic) {
+                        cc_error("va_start used in non-variadic function");
+                    }
+                    int gp_off = g_func.nparams * 8;
+                    if (gp_off > 64) gp_off = 64;
+                    int off = g_func.va_save_off + gp_off;
+                    rv_addi(RV_T1, RV_FP, off);
+                    rv_sd(RV_T1, RV_T0, 0);
+                    val_t vr;
+                    memset(&vr, 0, sizeof(vr));
+                    return vr;
+                }
+                if (strcmp(name, "va_arg") == 0) {
+                    /* va_arg(ap, type) — type is a C type, not an expression */
+                    parse_expect(T_LPAREN, "expected '('");
+                    val_t ap = parse_assign(lx);
+                    parse_expect(T_COMMA, "expected ','");
+                    type_t *arg_type = parse_type_spec(lx);
+                    while (accept(T_STAR)) arg_type = type_make_ptr(arg_type);
+                    while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
+                    parse_expect(T_RPAREN, "expected ')'");
+                    materialize(&ap, RV_T0);
+                    rv_ld(RV_T1, RV_T0, 0);
+                    uint64_t sz = type_sizeof(arg_type);
+                    switch (sz) {
+                        case 1: rv_lbu(RV_T2, RV_T1, 0); break;
+                        case 2: rv_lhu(RV_T2, RV_T1, 0); break;
+                        case 4: rv_lwu(RV_T2, RV_T1, 0); break;
+                        case 8: rv_ld(RV_T2, RV_T1, 0); break;
+                        default: rv_ld(RV_T2, RV_T1, 0); break;
+                    }
+                    rv_addi(RV_T1, RV_T1, 8);
+                    rv_sd(RV_T1, RV_T0, 0);
+                    val_t vr;
+                    memset(&vr, 0, sizeof(vr));
+                    vr.kind = VAL_REG;
+                    vr.reg = RV_T2;
+                    vr.type = arg_type;
+                    return vr;
+                }
+                if (strcmp(name, "va_end") == 0 || strcmp(name, "__builtin_va_end") == 0) {
+                    parse_expect(T_LPAREN, "expected '('");
+                    parse_assign(lx);
+                    parse_expect(T_RPAREN, "expected ')'");
+                    val_t vr;
+                    memset(&vr, 0, sizeof(vr));
+                    return vr;
                 }
                 int idx = symtab_lookup_global(name);
                 if (idx < 0) {
@@ -1160,6 +1326,20 @@ static void parse_compound(lexer_t *lx);
 static void parse_stmt(lexer_t *lx) {
     cc_pos_t pos = lx->cur.pos;
 
+    /* Label: identifier : */
+    if (lx->cur.kind == T_IDENT) {
+        lex_peek(lx);
+        if (lx->next.kind == T_COLON) {
+            char name[CC_MAX_IDENT];
+            strncpy(name, lx->cur.text, CC_MAX_IDENT - 1);
+            name[CC_MAX_IDENT - 1] = 0;
+            lex_next(lx);
+            lex_next(lx);
+            label_define(name);
+            return;
+        }
+    }
+
     /* Declarations inside a function are statements (C99). */
     if (is_type_start(lx)) {
         /* Local declaration: parse type + declarators, allocate stack slots. */
@@ -1282,6 +1462,7 @@ static void parse_stmt(lexer_t *lx) {
             load_value(&cond, RV_T0);
             rv_beq(RV_T0, RV_ZERO, 0);
             uint32_t br_off = (uint32_t)g_text.size - 4;
+            int saved_n_break = g_func.n_break_fixups;
             uint32_t saved_break = g_func.break_label;
             uint32_t saved_continue = g_func.continue_label;
             g_func.break_label = 0;
@@ -1293,20 +1474,13 @@ static void parse_stmt(lexer_t *lx) {
             uint32_t jmp_off = (uint32_t)g_text.size - 4;
             uint32_t end_label = (uint32_t)g_text.size;
             /* Patch conditional branch. */
-            int32_t d1 = (int32_t)end_label - (int32_t)br_off;
-            uint8_t *p1 = g_text.data + br_off;
-            uint32_t i1 = (uint32_t)p1[0] | ((uint32_t)p1[1] << 8) | ((uint32_t)p1[2] << 16) | ((uint32_t)p1[3] << 24);
-            i1 |= ((uint32_t)(d1 & 0x1000) << 19) | ((uint32_t)(d1 & 0x7E0) << 20) |
-                  ((uint32_t)(d1 & 0x1E) << 7) | ((uint32_t)(d1 & 0x800) >> 4);
-            p1[0] = i1 & 0xff; p1[1] = (i1 >> 8) & 0xff; p1[2] = (i1 >> 16) & 0xff; p1[3] = (i1 >> 24) & 0xff;
+            patch_branch(br_off, (int32_t)end_label - (int32_t)br_off);
             /* Patch loop-back jump. */
-            int32_t d2 = (int32_t)cond_label - (int32_t)jmp_off;
-            uint8_t *p2 = g_text.data + jmp_off;
-            uint32_t i2 = (uint32_t)p2[0] | ((uint32_t)p2[1] << 8) | ((uint32_t)p2[2] << 16) | ((uint32_t)p2[3] << 24);
-            i2 &= ~0xFFFFF000;
-            i2 |= ((uint32_t)(d2 & 0x100000) << 11) | ((uint32_t)(d2 & 0x7FE) << 20) |
-                  ((uint32_t)(d2 & 0x800) << 9) | ((uint32_t)(d2 & 0xFF000));
-            p2[0] = i2 & 0xff; p2[1] = (i2 >> 8) & 0xff; p2[2] = (i2 >> 16) & 0xff; p2[3] = (i2 >> 24) & 0xff;
+            patch_jal(jmp_off, (int32_t)cond_label - (int32_t)jmp_off);
+            /* Patch break fixups. */
+            for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
+                patch_jal(g_func.break_fixups[i], (int32_t)end_label - (int32_t)g_func.break_fixups[i]);
+            g_func.n_break_fixups = saved_n_break;
             g_func.break_label = saved_break;
             g_func.continue_label = saved_continue;
             return;
@@ -1329,14 +1503,13 @@ static void parse_stmt(lexer_t *lx) {
         case T_KW_BREAK: {
             lex_next(lx);
             parse_expect(T_SEMI, "expected ';'");
-            if (g_func.loop_depth == 0) {
-                cc_error("'break' outside loop");
+            if (g_func.loop_depth == 0 && g_func.switch_depth == 0) {
+                cc_error("'break' outside loop or switch");
                 return;
             }
-            /* Forward jump to break label (we'll fix up at loop end). */
-            /* For MVP we just emit a placeholder; the loop-end patcher
-             * doesn't handle break/continue. Defer. */
-            cc_warn("'break' not fully supported in MVP");
+            rv_jal(RV_ZERO, 0);
+            uint32_t br_off = (uint32_t)g_text.size - 4;
+            g_func.break_fixups[g_func.n_break_fixups++] = br_off;
             return;
         }
         case T_KW_CONTINUE:
@@ -1344,6 +1517,20 @@ static void parse_stmt(lexer_t *lx) {
             parse_expect(T_SEMI, "expected ';'");
             cc_warn("'continue' not fully supported in MVP");
             return;
+        case T_KW_GOTO: {
+            lex_next(lx);
+            if (lx->cur.kind != T_IDENT) {
+                parse_error("expected label name");
+                return;
+            }
+            char name[CC_MAX_IDENT];
+            strncpy(name, lx->cur.text, CC_MAX_IDENT - 1);
+            name[CC_MAX_IDENT - 1] = 0;
+            lex_next(lx);
+            parse_expect(T_SEMI, "expected ';'");
+            label_emit_jump(name);
+            return;
+        }
         case T_KW_FOR: {
             /* for(init; cond; post) body — desugar to while. */
             lex_next(lx);
@@ -1388,6 +1575,9 @@ static void parse_stmt(lexer_t *lx) {
             size_t post_end_off = lx->pos;
             parse_expect(T_RPAREN, "expected ')'");
 
+            int saved_n_break = g_func.n_break_fixups;
+            uint32_t saved_break = g_func.break_label;
+            g_func.break_label = 0;
             g_func.loop_depth++;
             parse_stmt(lx);
 
@@ -1399,22 +1589,58 @@ static void parse_stmt(lexer_t *lx) {
             uint32_t end_label = (uint32_t)g_text.size;
             g_func.loop_depth--;
 
-            if (has_cond) {
-                int32_t d1 = (int32_t)end_label - (int32_t)br_off;
-                uint8_t *p1 = g_text.data + br_off;
-                uint32_t i1 = (uint32_t)p1[0] | ((uint32_t)p1[1] << 8) | ((uint32_t)p1[2] << 16) | ((uint32_t)p1[3] << 24);
-                i1 |= ((uint32_t)(d1 & 0x1000) << 19) | ((uint32_t)(d1 & 0x7E0) << 20) |
-                      ((uint32_t)(d1 & 0x1E) << 7) | ((uint32_t)(d1 & 0x800) >> 4);
-                p1[0] = i1 & 0xff; p1[1] = (i1 >> 8) & 0xff; p1[2] = (i1 >> 16) & 0xff; p1[3] = (i1 >> 24) & 0xff;
-            }
-            int32_t d2 = (int32_t)cond_label - (int32_t)jmp_off;
-            uint8_t *p2 = g_text.data + jmp_off;
-            uint32_t i2 = (uint32_t)p2[0] | ((uint32_t)p2[1] << 8) | ((uint32_t)p2[2] << 16) | ((uint32_t)p2[3] << 24);
-            i2 &= ~0xFFFFF000;
-            i2 |= ((uint32_t)(d2 & 0x100000) << 11) | ((uint32_t)(d2 & 0x7FE) << 20) |
-                  ((uint32_t)(d2 & 0x800) << 9) | ((uint32_t)(d2 & 0xFF000));
-            p2[0] = i2 & 0xff; p2[1] = (i2 >> 8) & 0xff; p2[2] = (i2 >> 16) & 0xff; p2[3] = (i2 >> 24) & 0xff;
+            if (has_cond)
+                patch_branch(br_off, (int32_t)end_label - (int32_t)br_off);
+            patch_jal(jmp_off, (int32_t)cond_label - (int32_t)jmp_off);
+            for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
+                patch_jal(g_func.break_fixups[i], (int32_t)end_label - (int32_t)g_func.break_fixups[i]);
+            g_func.n_break_fixups = saved_n_break;
+            g_func.break_label = saved_break;
             symtab_pop_scope();
+            return;
+        }
+        case T_KW_SWITCH: {
+            lex_next(lx);
+            parse_expect(T_LPAREN, "expected '(' after switch");
+            val_t sv = parse_expr(lx);
+            parse_expect(T_RPAREN, "expected ')'");
+            load_value(&sv, RV_T0);
+            rv_mv(RV_T1, RV_T0);
+            parse_expect(T_LBRACE, "expected '{'");
+            uint32_t saved_break = g_func.break_label;
+            int saved_n_break = g_func.n_break_fixups;
+            g_func.break_label = 0;
+            g_func.switch_depth++;
+            uint32_t prev_branch = 0;
+            while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
+                if (lx->cur.kind == T_KW_CASE) {
+                    if (prev_branch)
+                        patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
+                    lex_next(lx);
+                    val_t cv = parse_expr(lx);
+                    load_value(&cv, RV_T0);
+                    parse_expect(T_COLON, "expected ':' after case value");
+                    rv_bne(RV_T1, RV_T0, 0);
+                    prev_branch = (uint32_t)g_text.size - 4;
+                } else if (lx->cur.kind == T_KW_DEFAULT) {
+                    if (prev_branch)
+                        patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
+                    prev_branch = 0;
+                    lex_next(lx);
+                    parse_expect(T_COLON, "expected ':' after default");
+                } else {
+                    parse_stmt(lx);
+                }
+            }
+            if (prev_branch)
+                patch_branch(prev_branch, (int32_t)g_text.size - (int32_t)prev_branch);
+            uint32_t end = (uint32_t)g_text.size;
+            for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
+                patch_jal(g_func.break_fixups[i], (int32_t)end - (int32_t)g_func.break_fixups[i]);
+            g_func.n_break_fixups = saved_n_break;
+            g_func.break_label = saved_break;
+            g_func.switch_depth--;
+            parse_expect(T_RBRACE, "expected '}' after switch");
             return;
         }
         default: {
@@ -1462,6 +1688,9 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
     g_func.max_call_args = 0;
     g_func.loop_depth = 0;
     g_func.in_function = true;
+    g_func.nparams = ftype->nparams;
+    g_func.is_variadic = ftype->is_varargs;
+    label_clear();
 
     /* Pre-allocate slots for parameters. */
     int arg_regs[8] = {RV_A0, RV_A1, RV_A2, RV_A3, RV_A4, RV_A5, RV_A6, RV_A7};
@@ -1476,6 +1705,13 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
         int idx = symtab_install_local(ftype->params[i].name, SYM_LOCAL_VAR, ptyp, 1);
         g_locals[idx].offset = off;
         param_slots[i] = (int)off;
+    }
+    if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
+
+    /* For variadic functions: reserve 64 bytes for register save area (a0-a7). */
+    if (ftype->is_varargs) {
+        g_func.cur_offset += 64;
+        g_func.cur_offset = (g_func.cur_offset + 7) & ~7;
     }
     if (g_func.cur_offset > g_func.frame_size) g_func.frame_size = g_func.cur_offset;
 
@@ -1511,6 +1747,14 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
         }
     }
 
+    /* For variadic functions: save all a0-a7 to the register save area. */
+    if (ftype->is_varargs) {
+        g_func.va_save_off = -(int)g_func.cur_offset;
+        for (int i = 0; i < 8; i++) {
+            rv_sd(arg_regs[i], RV_FP, g_func.va_save_off + i * 8);
+        }
+    }
+
     parse_compound(lx);
 
     /* Default return. */
@@ -1531,6 +1775,7 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
     p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff; p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
 
     rv_resolve_fixups();
+    label_check_unresolved();
     free(param_slots);
 
     g_func.in_function = false;

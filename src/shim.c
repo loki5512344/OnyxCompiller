@@ -563,10 +563,20 @@ int getopt_long(int argc, char *const argv[], const char *optstring,
 /* ---- entry point ---- */
 extern int main(int argc, char **argv);
 
+/* Read argc (a0) and argv (a1) from RISC-V calling convention.
+ * If argc == 0 (kernel didn't pass args), default to argc=1, argv={"onyxcc"} */
 void _start(void) {
-    /* OnyxOS MVP: no argc/argv. Pass argc=1, argv=&{progname}. */
-    static char progname[] = "onyxcc";
-    char *argv[] = { progname, NULL };
-    int ret = main(1, argv);
+    int argc;
+    char **argv;
+    __asm__("mv %0, a0" : "=r"(argc));
+    __asm__("mv %0, a1" : "=r"(argv));
+    if (argc == 0) {
+        static char progname[] = "onyxcc";
+        static char *default_argv[] = { NULL, NULL };
+        default_argv[0] = progname;
+        argc = 1;
+        argv = default_argv;
+    }
+    int ret = main(argc, argv);
     _exit(ret);
 }

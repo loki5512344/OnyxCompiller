@@ -14,9 +14,15 @@ typedef struct {
     int frame_size;        /* total stack frame, aligned 16 */
     int cur_offset;        /* next free slot for locals */
     int max_call_args;     /* max args passed to any call (for stack save) */
+    int nparams;           /* number of named parameters */
+    bool is_variadic;      /* current function has variadic args */
+    int va_save_off;       /* fp offset to register save area (variadic only) */
     uint32_t break_label;
     uint32_t continue_label;
     int loop_depth;
+    int switch_depth;
+    uint32_t break_fixups[256];
+    int n_break_fixups;
     bool in_function;
 } gen_func_t;
 
