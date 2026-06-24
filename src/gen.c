@@ -1130,51 +1130,131 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
         token_kind_t op = lx->cur.kind;
         lex_next(lx);
 
-        /* Short-circuit for && and ||. */
+        /* Short-circuit for && and ||.
+         *
+         * Emit pattern (for &&):
+         *     <eval lhs>          -> T0
+         *     beq T0, zero, Lfalse   ; if lhs==0, jump to Lfalse
+         *     <eval rhs>          -> T0
+         *     j Lend
+         *   Lfalse:
+         *     li T0, 0
+         *   Lend:
+         *
+         * For || it's the dual:
+         *     <eval lhs>          -> T0
+         *     bne T0, zero, Ltrue    ; if lhs!=0, jump to Ltrue
+         *     <eval rhs>          -> T0
+         *     j Lend
+         *   Ltrue:
+         *     li T0, 1
+         *   Lend:
+         *
+         * Note: we must NOT recurse into parse_binop_rhs here because the
+         * surrounding loop already consumes the operator and we now own the
+         * lexer. We parse exactly one RHS operand via parse_binop (which
+         * honors precedence) and then continue the outer loop so that
+         * subsequent operators at our level are handled correctly.
+         */
         if (op == T_AND || op == T_OR) {
             load_value(&lhs, RV_T0);
-            /* If false (for &&) or true (for ||), short-circuit. */
-            uint32_t skip = 0;
             if (op == T_AND) {
-                rv_beq(RV_T0, RV_ZERO, 0);  /* placeholder, patch later */
-                uint32_t br_off = (uint32_t)g_text.size - 4;
-                val_t rhs = parse_binop_rhs(lx, prec + 1, lhs);
+                /* if lhs==0, jump to false label */
+                rv_beq(RV_T0, RV_ZERO, 0);
+                uint32_t br_false = (uint32_t)g_text.size - 4;
+                /* parse RHS: parse_unary then continue with higher-precedence ops */
+                val_t rhs = parse_unary(lx);
+                int next_prec = op_prec(lx->cur.kind);
+                if (next_prec > prec) {
+                    rhs = parse_binop_rhs(lx, prec + 1, rhs);
+                }
                 load_value(&rhs, RV_T0);
-                /* Patch the branch. */
-                int32_t delta = (int32_t)g_text.size - (int32_t)br_off;
-                uint8_t *p = g_text.data + br_off;
-                uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                                ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-                insn |= ((uint32_t)(delta & 0x1000) << 19) |
-                        ((uint32_t)(delta & 0x7E0) << 20) |
-                        ((uint32_t)(delta & 0x1E) << 7)  |
-                        ((uint32_t)(delta & 0x800) >> 4);
-                p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
-                p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
-                lhs = rhs;
-                lhs.kind = VAL_REG;
-                lhs.reg = RV_T0;
-                lhs.type = &ty_int;
+                /* normalize: any non-zero becomes 1 */
+                rv_snez(RV_T0, RV_T0);
+                /* jump to end */
+                rv_jal(RV_ZERO, 0);
+                uint32_t jmp_end = (uint32_t)g_text.size - 4;
+                /* false: */
+                uint32_t false_label = (uint32_t)g_text.size;
+                rv_addi(RV_T0, RV_ZERO, 0);
+                /* end: */
+                uint32_t end_label = (uint32_t)g_text.size;
+                /* patch br_false to false_label */
+                {
+                    int32_t delta = (int32_t)false_label - (int32_t)br_false;
+                    uint8_t *p = g_text.data + br_false;
+                    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+                    insn |= ((uint32_t)(delta & 0x1000) << 19) |
+                            ((uint32_t)(delta & 0x7E0) << 20) |
+                            ((uint32_t)(delta & 0x1E) << 7)  |
+                            ((uint32_t)(delta & 0x800) >> 4);
+                    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+                    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
+                }
+                /* patch jmp_end to end_label */
+                {
+                    int32_t delta = (int32_t)end_label - (int32_t)jmp_end;
+                    uint8_t *p = g_text.data + jmp_end;
+                    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+                    /* jal is J-type: imm[20|10:1|11|19:12] at bits 31|30:21|20|19:12 */
+                    uint32_t imm = ((uint32_t)((delta >> 20) & 1) << 31) |
+                                   ((uint32_t)((delta >> 1) & 0x3FF) << 21) |
+                                   ((uint32_t)((delta >> 11) & 1) << 20) |
+                                   ((uint32_t)((delta >> 12) & 0xFF) << 12);
+                    insn = (insn & 0xFFF) | imm;
+                    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+                    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
+                }
             } else {
-                rv_bne(RV_T0, RV_ZERO, 0);  /* if true, skip */
-                uint32_t br_off = (uint32_t)g_text.size - 4;
-                val_t rhs = parse_binop_rhs(lx, prec + 1, lhs);
+                /* if lhs!=0, jump to true label */
+                rv_bne(RV_T0, RV_ZERO, 0);
+                uint32_t br_true = (uint32_t)g_text.size - 4;
+                val_t rhs = parse_unary(lx);
+                int next_prec = op_prec(lx->cur.kind);
+                if (next_prec > prec) {
+                    rhs = parse_binop_rhs(lx, prec + 1, rhs);
+                }
                 load_value(&rhs, RV_T0);
-                int32_t delta = (int32_t)g_text.size - (int32_t)br_off;
-                uint8_t *p = g_text.data + br_off;
-                uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                                ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-                insn |= ((uint32_t)(delta & 0x1000) << 19) |
-                        ((uint32_t)(delta & 0x7E0) << 20) |
-                        ((uint32_t)(delta & 0x1E) << 7)  |
-                        ((uint32_t)(delta & 0x800) >> 4);
-                p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
-                p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
-                lhs = rhs;
-                lhs.kind = VAL_REG;
-                lhs.reg = RV_T0;
-                lhs.type = &ty_int;
+                rv_snez(RV_T0, RV_T0);
+                rv_jal(RV_ZERO, 0);
+                uint32_t jmp_end = (uint32_t)g_text.size - 4;
+                uint32_t true_label = (uint32_t)g_text.size;
+                rv_addi(RV_T0, RV_ZERO, 1);
+                uint32_t end_label = (uint32_t)g_text.size;
+                /* patch br_true to true_label */
+                {
+                    int32_t delta = (int32_t)true_label - (int32_t)br_true;
+                    uint8_t *p = g_text.data + br_true;
+                    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+                    insn |= ((uint32_t)(delta & 0x1000) << 19) |
+                            ((uint32_t)(delta & 0x7E0) << 20) |
+                            ((uint32_t)(delta & 0x1E) << 7)  |
+                            ((uint32_t)(delta & 0x800) >> 4);
+                    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+                    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
+                }
+                /* patch jmp_end to end_label */
+                {
+                    int32_t delta = (int32_t)end_label - (int32_t)jmp_end;
+                    uint8_t *p = g_text.data + jmp_end;
+                    uint32_t insn = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+                    uint32_t imm = ((uint32_t)((delta >> 20) & 1) << 31) |
+                                   ((uint32_t)((delta >> 1) & 0x3FF) << 21) |
+                                   ((uint32_t)((delta >> 11) & 1) << 20) |
+                                   ((uint32_t)((delta >> 12) & 0xFF) << 12);
+                    insn = (insn & 0xFFF) | imm;
+                    p[0] = insn & 0xff; p[1] = (insn >> 8) & 0xff;
+                    p[2] = (insn >> 16) & 0xff; p[3] = (insn >> 24) & 0xff;
+                }
             }
+            /* Result is in T0; treat as int. */
+            lhs.kind = VAL_REG;
+            lhs.reg = RV_T0;
+            lhs.type = &ty_int;
             continue;
         }
 

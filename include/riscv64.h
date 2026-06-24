@@ -123,6 +123,7 @@ void rv_mv(int rd, int rs);     /* addi rd, rs, 0 */
 void rv_neg(int rd, int rs);    /* sub rd, x0, rs */
 void rv_not(int rd, int rs);    /* xori rd, rs, -1 */
 void rv_seqz(int rd, int rs);   /* sltiu rd, rs, 1 */
+void rv_snez(int rd, int rs);   /* sltu rd, x0, rs */
 
 /* Branch/jump to a label not yet known: emit a placeholder and push
  * a fixup. The caller resolves the label later via rv_label(). */

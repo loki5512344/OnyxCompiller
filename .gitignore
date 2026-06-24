@@ -2,3 +2,6 @@
 *.tmp
 *.log
 build/
+onyxcc.riscv.elf
+onyxcc.onx
+tests/*.onx

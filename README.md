@@ -28,11 +28,14 @@ OnyxOS и умеет собирать сам себя, а также всю user
 ## Что НЕ работает (пока)
 
 - ❌ C++ фронтенд (структура заголовков готова, парсера нет)
-- ❌ Полная variadic arguments (`...`) — работает только для `printf`-стиля через ручной stack walk
+- ✅ Полная variadic arguments (`...`) — `va_start` / `va_arg` / `va_end` builtins,
+  a0–a7 save area в прологе variadic-функции
 - ❌ Линковка нескольких `.c` файлов в один `.onx` (MVP — один translation unit)
 - ❌ Float/double в codegen (типы есть, инструкции F/D не эмитятся)
-- ❌ `switch`/`case`/`default`
-- ❌ `goto` и labels
+- ✅ `switch`/`case`/`default` — linear compare chain, `break` поддержан
+- ✅ `goto` и labels — как backward, так и forward jumps
+- ✅ `&&`/`||` с short-circuit семантикой (исправлен баг, когда RHS парсился
+  дважды и ломал поток токенов)
 - ❌ Глобальные инициализаторы с массивами/строками (только скаляры)
 - ❌ Compound literals, designated initializers
 - ❌ Inline assembly (заменено на `__ecallN` builtins)

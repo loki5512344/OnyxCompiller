@@ -256,6 +256,7 @@ void rv_mv(int rd, int rs)    { rv_addi(rd, rs, 0); }
 void rv_neg(int rd, int rs)   { rv_sub(rd, RV_ZERO, rs); }
 void rv_not(int rd, int rs)   { rv_addi(rd, rs, -1); }
 void rv_seqz(int rd, int rs)  { rv_sltiu(rd, rs, 1); }
+void rv_snez(int rd, int rs)  { rv_sltu(rd, RV_ZERO, rs); }
 
 /* Token-based branch (used by codegen for if/while conditions). */
 void rv_branch(int rs1, int rs2, int op_token, uint32_t *label_out) {
