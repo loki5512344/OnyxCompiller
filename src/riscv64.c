@@ -166,6 +166,38 @@ void rv_sltiu(int rd, int rs1, int imm) {
     emit32(insn);
 }
 
+/* Shift-immediate: I-type, funct3 distinguishes slli/srli/srai.
+ * slli: funct3=0x1, imm[11:5]=0x00
+ * srli: funct3=0x5, imm[11:5]=0x00
+ * srai: funct3=0x5, imm[11:5]=0x20
+ * For RV64, shamt is 6 bits (imm[5:0]), imm[11:6] carries the funct7 bits.
+ */
+void rv_slli(int rd, int rs1, int shamt) {
+    uint32_t insn = ((uint32_t)(shamt & 0x3F) << 20)
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x1 << 12
+                  | (uint32_t)(rd & 0x1F) << 7
+                  | 0x13;
+    emit32(insn);
+}
+void rv_srli(int rd, int rs1, int shamt) {
+    uint32_t insn = ((uint32_t)(shamt & 0x3F) << 20)
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x5 << 12
+                  | (uint32_t)(rd & 0x1F) << 7
+                  | 0x13;
+    emit32(insn);
+}
+void rv_srai(int rd, int rs1, int shamt) {
+    uint32_t insn = (0x20 << 25)
+                  | ((uint32_t)(shamt & 0x3F) << 20)
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x5 << 12
+                  | (uint32_t)(rd & 0x1F) << 7
+                  | 0x13;
+    emit32(insn);
+}
+
 /* Loads: opcode 0x03 */
 static void emit_i_load(int funct3, int rd, int rs1, int imm) {
     uint32_t insn = (uint32_t)(imm & 0xFFF) << 20

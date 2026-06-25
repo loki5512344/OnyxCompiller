@@ -125,6 +125,9 @@ void rv_slt(int rd, int rs1, int rs2);
 void rv_sltu(int rd, int rs1, int rs2);
 void rv_slti(int rd, int rs1, int imm);
 void rv_sltiu(int rd, int rs1, int imm);
+void rv_slli(int rd, int rs1, int shamt);
+void rv_srli(int rd, int rs1, int shamt);
+void rv_srai(int rd, int rs1, int shamt);
 
 void rv_lb(int rd, int rs1, int imm);
 void rv_lbu(int rd, int rs1, int imm);

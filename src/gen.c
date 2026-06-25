@@ -31,6 +31,16 @@
 
 gen_func_t g_func;
 
+/* ---- Fixups for rodata references ----------------------------------- */
+typedef struct {
+    uint32_t rodata_off;   /* offset within rodata */
+    uint32_t patch_lui;
+    uint32_t patch_addi;
+} rodata_fixup_t;
+
+static rodata_fixup_t g_rodata_fixups[4096];
+static int g_n_rodata_fixups = 0;
+
 /* ---- Value descriptor ------------------------------------------------ */
 typedef enum {
     VAL_REG,    /* value in .reg */
@@ -57,6 +67,7 @@ static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
 static void patch_jal(uint32_t off, int32_t delta);
 static void patch_sd_imm(uint32_t off, int32_t imm);
+static void parse_asm(lexer_t *lx);
 
 /* ---- Label table for goto/label ------------------------------------- */
 #define MAX_LABELS 256
@@ -264,6 +275,20 @@ static void load_float_value(val_t *v, int freg) {
         materialize_float_const(v, freg);
         return;
     }
+    if (v->kind == VAL_IMM && !is_float_type(v->type)) {
+        /* Integer constant → float: materialize int, then fcvt. */
+        materialize(v, RV_T0);
+        bool is_double = v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE);
+        if (is_double) {
+            rv_fcvt_d_l(freg, RV_T0);
+        } else {
+            rv_fcvt_s_l(freg, RV_T0);
+        }
+        v->kind = VAL_REG;
+        v->reg = freg;
+        v->offset = 0;
+        return;
+    }
     /* For LVAL/SYM: materialize address, then flw/fld. */
     materialize(v, RV_T0);
     if (v->kind == VAL_LVAL) {
@@ -279,20 +304,24 @@ static void load_float_value(val_t *v, int freg) {
         return;
     }
     if (v->kind == VAL_REG) {
-        /* Already in a register. If it's an int reg, we need to convert. */
-        if (!is_float_type(v->type) && is_float_type(v->type)) {
-            /* Should not happen normally. */
-        }
-        if (v->reg != freg) {
+        /* Already in a register. */
+        if (v->reg == freg) return;
+        if (is_float_type(v->type)) {
             /* Move between float regs: use fsgnj (fmv within float file). */
-            /* fsgnj.s: funct7=0x10, funct3=0x0 — copy sign from rs1 */
             if (v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE)) {
                 rv_emit_fpu_r(0x11, 0x0, freg, v->reg, v->reg); /* fsgnj.d */
             } else {
                 rv_emit_fpu_r(0x10, 0x0, freg, v->reg, v->reg); /* fsgnj.s */
             }
-            v->reg = freg;
+        } else {
+            /* Int reg → float reg via fcvt. */
+            if (v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE)) {
+                rv_fcvt_d_l(freg, v->reg);
+            } else {
+                rv_fcvt_s_l(freg, v->reg);
+            }
         }
+        v->reg = freg;
     }
 }
 
@@ -623,15 +652,7 @@ typedef struct {
 static global_addr_fixup_t g_fixups[4096];
 static int g_n_fixups = 0;
 
-/* Fixups for rodata references (string literals). */
-typedef struct {
-    uint32_t rodata_off;   /* offset within rodata */
-    uint32_t patch_lui;
-    uint32_t patch_addi;
-} rodata_fixup_t;
-
-static rodata_fixup_t g_rodata_fixups[4096];
-static int g_n_rodata_fixups = 0;
+/* rodata_fixup_t and g_rodata_fixups moved to top of file. */
 
 /* Fixups for global data pointing to rodata (string initializers). */
 typedef struct {
@@ -791,7 +812,7 @@ static val_t parse_primary(lexer_t *lx) {
                         if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
                             /* Walk struct fields to find offset. */
                             type_t *st = t;
-                            if (st->n_fields > 0 && field_idx < st->n_fields) {
+                            if (st->nfields > 0 && field_idx < st->nfields) {
                                 elem_off = st->fields[field_idx].offset;
                             }
                         } else if (t->kind == TY_ARRAY) {
@@ -819,12 +840,104 @@ static val_t parse_primary(lexer_t *lx) {
                     return v;
                 }
                 val_t e = parse_unary(lx);
+                /* Cast handling: int↔float, float↔double, int truncation */
+                bool src_float = is_float_type(e.type);
+                bool dst_float = is_float_type(t);
+                if (src_float && dst_float) {
+                    /* float↔double: fcvt.s.d or fcvt.d.s */
+                    bool src_d = (e.type->kind == TY_DOUBLE || e.type->kind == TY_LDOUBLE);
+                    bool dst_d = (t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE);
+                    if (src_d && !dst_d) {
+                        /* double → float */
+                        load_float_value(&e, RV_FT0);
+                        rv_fcvt_s_d(RV_FT1, RV_FT0);
+                        e.reg = RV_FT1;
+                    } else if (!src_d && dst_d) {
+                        /* float → double */
+                        load_float_value(&e, RV_FT0);
+                        rv_fcvt_d_s(RV_FT1, RV_FT0);
+                        e.reg = RV_FT1;
+                    } else {
+                        /* same size float: just load */
+                        load_float_value(&e, RV_FT0);
+                        e.reg = RV_FT0;
+                    }
+                    e.type = t;
+                    e.kind = VAL_REG;
+                    return e;
+                }
+                if (src_float && !dst_float) {
+                    /* float/double → int: fcvt.l.s or fcvt.l.d */
+                    bool src_d = (e.type->kind == TY_DOUBLE || e.type->kind == TY_LDOUBLE);
+                    load_float_value(&e, RV_FT0);
+                    if (src_d) {
+                        rv_fcvt_l_d(RV_T0, RV_FT0);
+                    } else {
+                        rv_fcvt_l_s(RV_T0, RV_FT0);
+                    }
+                    /* Truncate to target integer size. */
+                    if (type_is_integer(t) && type_sizeof(t) < 8) {
+                        uint64_t sz = type_sizeof(t);
+                        /* Sign/zero extend handled at store; mask for safety. */
+                        if (sz == 4) {
+                            rv_slli(RV_T0, RV_T0, 32);
+                            rv_srli(RV_T0, RV_T0, 32);
+                        } else if (sz == 2) {
+                            rv_slli(RV_T0, RV_T0, 48);
+                            rv_srli(RV_T0, RV_T0, 48);
+                        } else if (sz == 1) {
+                            rv_slli(RV_T0, RV_T0, 56);
+                            rv_srli(RV_T0, RV_T0, 56);
+                        }
+                    }
+                    e.type = t;
+                    e.kind = VAL_REG;
+                    e.reg = RV_T0;
+                    return e;
+                }
+                if (!src_float && dst_float) {
+                    /* int → float/double: fcvt.s.l or fcvt.d.l */
+                    load_value(&e, RV_T0);
+                    bool dst_d = (t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE);
+                    if (dst_d) {
+                        rv_fcvt_d_l(RV_FT0, RV_T0);
+                    } else {
+                        rv_fcvt_s_l(RV_FT0, RV_T0);
+                    }
+                    e.type = t;
+                    e.kind = VAL_REG;
+                    e.reg = RV_FT0;
+                    return e;
+                }
+                /* int → int cast: truncate / extend */
                 load_value(&e, RV_T0);
-                /* Cast: truncate / extend based on target type. */
                 if (type_is_integer(t) && type_sizeof(t) < 8) {
                     uint64_t sz = type_sizeof(t);
-                    if (sz == 1) type_is_signed(t) ? rv_addi(RV_T0, RV_T0, 0) /* noop; we trust caller */ : 0;
-                    /* For MVP we leave full 64-bit; truncation handled at store. */
+                    if (sz == 4) {
+                        if (type_is_signed(t)) {
+                            rv_slli(RV_T0, RV_T0, 32);
+                            rv_srai(RV_T0, RV_T0, 32);
+                        } else {
+                            rv_slli(RV_T0, RV_T0, 32);
+                            rv_srli(RV_T0, RV_T0, 32);
+                        }
+                    } else if (sz == 2) {
+                        if (type_is_signed(t)) {
+                            rv_slli(RV_T0, RV_T0, 48);
+                            rv_srai(RV_T0, RV_T0, 48);
+                        } else {
+                            rv_slli(RV_T0, RV_T0, 48);
+                            rv_srli(RV_T0, RV_T0, 48);
+                        }
+                    } else if (sz == 1) {
+                        if (type_is_signed(t)) {
+                            rv_slli(RV_T0, RV_T0, 56);
+                            rv_srai(RV_T0, RV_T0, 56);
+                        } else {
+                            rv_slli(RV_T0, RV_T0, 56);
+                            rv_srli(RV_T0, RV_T0, 56);
+                        }
+                    }
                 }
                 e.type = t;
                 e.reg = RV_T0;
@@ -1158,9 +1271,16 @@ static val_t parse_unary(lexer_t *lx) {
         case T_MINUS: {
             lex_next(lx);
             val_t e = parse_unary(lx);
-            load_value(&e, RV_T0);
-            rv_neg(RV_T0, RV_T0);
-            e.reg = RV_T0;
+            if (is_float_type(e.type)) {
+                load_float_value(&e, RV_FT0);
+                bool is_d = (e.type->kind == TY_DOUBLE || e.type->kind == TY_LDOUBLE);
+                is_d ? rv_fneg_d(RV_FT0, RV_FT0) : rv_fneg_s(RV_FT0, RV_FT0);
+                e.reg = RV_FT0;
+            } else {
+                load_value(&e, RV_T0);
+                rv_neg(RV_T0, RV_T0);
+                e.reg = RV_T0;
+            }
             return e;
         }
         case T_PLUS: {
@@ -1261,6 +1381,41 @@ static void gen_store(val_t *lhs, val_t *rhs, int op) {
         cc_error("assignment requires lvalue");
         return;
     }
+
+    bool fp_lhs = is_float_type(lhs->type);
+
+    if (fp_lhs) {
+        /* Float/double store path. */
+        load_float_value(rhs, RV_FT0);
+        if (op != T_ASSIGN) {
+            val_t cur = *lhs;
+            load_float_value(&cur, RV_FT1);
+            bool is_d = (lhs->type->kind == TY_DOUBLE || lhs->type->kind == TY_LDOUBLE);
+            switch (op) {
+                case T_PLUS_ASSIGN:  is_d ? rv_fadd_d(RV_FT0, RV_FT1, RV_FT0) : rv_fadd_s(RV_FT0, RV_FT1, RV_FT0); break;
+                case T_MINUS_ASSIGN: is_d ? rv_fsub_d(RV_FT0, RV_FT1, RV_FT0) : rv_fsub_s(RV_FT0, RV_FT1, RV_FT0); break;
+                case T_STAR_ASSIGN:  is_d ? rv_fmul_d(RV_FT0, RV_FT1, RV_FT0) : rv_fmul_s(RV_FT0, RV_FT1, RV_FT0); break;
+                case T_SLASH_ASSIGN: is_d ? rv_fdiv_d(RV_FT0, RV_FT1, RV_FT0) : rv_fdiv_s(RV_FT0, RV_FT1, RV_FT0); break;
+                default: cc_error("invalid compound assignment for float"); break;
+            }
+        }
+        /* Compute address of LHS into T0. */
+        int addr_reg = RV_T0;
+        if (lhs->kind == VAL_SYM) {
+            materialize(lhs, addr_reg);
+        } else {
+            rv_addi(addr_reg, lhs->reg, (int)lhs->offset);
+        }
+        /* Store float reg to memory. */
+        bool is_d = (lhs->type->kind == TY_DOUBLE || lhs->type->kind == TY_LDOUBLE);
+        if (is_d) {
+            rv_fsd(RV_FT0, addr_reg, 0);
+        } else {
+            rv_fsw(RV_FT0, addr_reg, 0);
+        }
+        return;
+    }
+
     /* Evaluate RHS into T0. */
     load_value(rhs, RV_T0);
 
@@ -1468,11 +1623,67 @@ static val_t parse_binop_rhs(lexer_t *lx, int min_prec, val_t lhs) {
             rhs = parse_binop_rhs(lx, prec + 1, rhs);
         }
 
+        /* Type promotion for arithmetic. */
+        type_t *common = type_common(lhs.type, rhs.type);
+        bool fp_arith = is_float_type(common);
+
+        if (fp_arith) {
+            /* Float/double arithmetic — use FPU registers. */
+            bool is_d = (common->kind == TY_DOUBLE || common->kind == TY_LDOUBLE);
+            load_float_value(&lhs, RV_FT0);
+            load_float_value(&rhs, RV_FT1);
+            switch (op) {
+                case T_PLUS:
+                    is_d ? rv_fadd_d(RV_FT0, RV_FT0, RV_FT1) : rv_fadd_s(RV_FT0, RV_FT0, RV_FT1);
+                    break;
+                case T_MINUS:
+                    is_d ? rv_fsub_d(RV_FT0, RV_FT0, RV_FT1) : rv_fsub_s(RV_FT0, RV_FT0, RV_FT1);
+                    break;
+                case T_STAR:
+                    is_d ? rv_fmul_d(RV_FT0, RV_FT0, RV_FT1) : rv_fmul_s(RV_FT0, RV_FT0, RV_FT1);
+                    break;
+                case T_SLASH:
+                    is_d ? rv_fdiv_d(RV_FT0, RV_FT0, RV_FT1) : rv_fdiv_s(RV_FT0, RV_FT0, RV_FT1);
+                    break;
+                case T_EQ:
+                    is_d ? rv_feq_d(RV_T0, RV_FT0, RV_FT1) : rv_feq_s(RV_T0, RV_FT0, RV_FT1);
+                    lhs.kind = VAL_REG; lhs.reg = RV_T0; lhs.type = &ty_int;
+                    continue;
+                case T_NE:
+                    is_d ? rv_feq_d(RV_T0, RV_FT0, RV_FT1) : rv_feq_s(RV_T0, RV_FT0, RV_FT1);
+                    /* feq gives 0 or 1; NE = !feq = (feq == 0) = sltiu(rd, rd, 1) */
+                    rv_sltiu(RV_T0, RV_T0, 1);
+                    lhs.kind = VAL_REG; lhs.reg = RV_T0; lhs.type = &ty_int;
+                    continue;
+                case T_LT:
+                    is_d ? rv_flt_d(RV_T0, RV_FT0, RV_FT1) : rv_flt_s(RV_T0, RV_FT0, RV_FT1);
+                    lhs.kind = VAL_REG; lhs.reg = RV_T0; lhs.type = &ty_int;
+                    continue;
+                case T_GT:
+                    is_d ? rv_flt_d(RV_T0, RV_FT1, RV_FT0) : rv_flt_s(RV_T0, RV_FT1, RV_FT0);
+                    lhs.kind = VAL_REG; lhs.reg = RV_T0; lhs.type = &ty_int;
+                    continue;
+                case T_LE:
+                    is_d ? rv_fle_d(RV_T0, RV_FT0, RV_FT1) : rv_fle_s(RV_T0, RV_FT0, RV_FT1);
+                    lhs.kind = VAL_REG; lhs.reg = RV_T0; lhs.type = &ty_int;
+                    continue;
+                case T_GE:
+                    is_d ? rv_fle_d(RV_T0, RV_FT1, RV_FT0) : rv_fle_s(RV_T0, RV_FT1, RV_FT0);
+                    lhs.kind = VAL_REG; lhs.reg = RV_T0; lhs.type = &ty_int;
+                    continue;
+                default:
+                    cc_error("invalid operation on float/double");
+                    break;
+            }
+            lhs.kind = VAL_REG;
+            lhs.reg = RV_FT0;
+            lhs.type = common;
+            continue;
+        }
+
         load_value(&lhs, RV_T0);
         load_value(&rhs, RV_T1);
 
-        /* Type promotion for arithmetic. */
-        type_t *common = type_common(lhs.type, rhs.type);
         if (type_is_pointer(lhs.type) && type_is_integer(rhs.type)) {
             /* pointer + int → pointer arithmetic, scale by sizeof(*lhs). */
             uint64_t sz = type_sizeof(lhs.type->base);
@@ -1607,6 +1818,175 @@ static val_t parse_expr(lexer_t *lx) {
 /* Forward. */
 static void parse_compound(lexer_t *lx);
 
+/* ---- Inline assembly ------------------------------------------------ */
+/* Hex digit value (local copy for asm template parsing). */
+static int gen_hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Parse GCC-style inline asm:
+ *   asm volatile("template" : outputs : inputs : clobbers);
+ *   asm("template");
+ * For MVP we only emit the raw instruction bytes from the template string.
+ * Operand substitution (%0, %1, ...) and clobbers are ignored for now.
+ */
+static void parse_asm(lexer_t *lx) {
+    lex_next(lx); /* consume 'asm' */
+    /* Optional 'volatile' keyword. */
+    if (lx->cur.kind == T_KW_VOLATILE) lex_next(lx);
+    parse_expect(T_LPAREN, "expected '(' after asm");
+    /* Must be a string literal. */
+    if (lx->cur.kind != T_STRING) {
+        cc_error("expected string literal in asm");
+        /* Skip to closing paren. */
+        while (lx->cur.kind != T_RPAREN && lx->cur.kind != T_SEMI && lx->cur.kind != T_EOF)
+            lex_next(lx);
+        if (lx->cur.kind == T_RPAREN) lex_next(lx);
+        parse_expect(T_SEMI, "expected ';'");
+        return;
+    }
+    const char *tmpl = lx->cur.str;
+    size_t tmpl_len = lx->cur.str_len;
+    lex_next(lx);
+
+    /* Skip output/input/clobber operands (everything up to ')'). */
+    /* For MVP we just parse : ... : ... : ... but ignore them. */
+    while (lx->cur.kind != T_RPAREN && lx->cur.kind != T_EOF) {
+        lex_next(lx);
+    }
+    parse_expect(T_RPAREN, "expected ')' after asm");
+    parse_expect(T_SEMI, "expected ';' after asm");
+
+    /* Emit the raw instruction bytes from the template.
+     * The template may contain RISC-V instructions encoded as .byte/.word
+     * directives, or we support a simple subset of mnemonics.
+     * For maximum flexibility, we parse .byte/.word directives in the
+     * template and emit the corresponding bytes.  Raw hex like
+     *   .word 0x00000013  ->  nop
+     * is supported.  Otherwise, we emit each character as-is (which
+     * would be wrong for actual asm; this is a placeholder).
+     *
+     * Most common use: asm volatile(".word 0x...") or asm volatile("nop")
+     * We support:
+     *   - .word 0xNNNNNNNN  (emit 4 bytes LE)
+     *   - .byte 0xNN        (emit 1 byte)
+     *   - nop               (emit 0x00000013)
+     *   - ecall             (emit 0x00000073)
+     *   - ebreak            (emit 0x00100073)
+     *   - fence             (emit 0x0FF0000F)
+     *   - fence.i           (emit 0x0100000F)
+     *   - csr_rcw ...       (placeholder)
+     */
+    size_t i = 0;
+    while (i < tmpl_len) {
+        /* Skip whitespace. */
+        while (i < tmpl_len && (tmpl[i] == ' ' || tmpl[i] == '\t' || tmpl[i] == '\n' || tmpl[i] == '\r'))
+            i++;
+        if (i >= tmpl_len) break;
+
+        /* .word directive */
+        if (tmpl[i] == '.' && i + 4 < tmpl_len &&
+            (tmpl[i+1] == 'w' || tmpl[i+1] == 'W') &&
+            (tmpl[i+2] == 'o' || tmpl[i+2] == 'O') &&
+            (tmpl[i+3] == 'r' || tmpl[i+3] == 'R') &&
+            (tmpl[i+4] == 'd' || tmpl[i+4] == 'D')) {
+            i += 5;
+            while (i < tmpl_len && tmpl[i] == ' ') i++;
+            if (i < tmpl_len && (tmpl[i] == '0') && (i+1 < tmpl_len && (tmpl[i+1] == 'x' || tmpl[i+1] == 'X'))) {
+                i += 2;
+                uint32_t val = 0;
+                while (i < tmpl_len && isxdigit((unsigned char)tmpl[i])) {
+                    int d = gen_hexval(tmpl[i]);
+                    val = (val << 4) | d;
+                    i++;
+                }
+                /* Emit as 4 bytes little-endian. */
+                cc_buf_push8(&g_text, val & 0xFF);
+                cc_buf_push8(&g_text, (val >> 8) & 0xFF);
+                cc_buf_push8(&g_text, (val >> 16) & 0xFF);
+                cc_buf_push8(&g_text, (val >> 24) & 0xFF);
+            }
+            continue;
+        }
+        /* .byte directive */
+        if (tmpl[i] == '.' && i + 4 < tmpl_len &&
+            (tmpl[i+1] == 'b' || tmpl[i+1] == 'B') &&
+            (tmpl[i+2] == 'y' || tmpl[i+2] == 'Y') &&
+            (tmpl[i+3] == 't' || tmpl[i+3] == 'T') &&
+            (tmpl[i+4] == 'e' || tmpl[i+4] == 'E')) {
+            i += 5;
+            while (i < tmpl_len && tmpl[i] == ' ') i++;
+            if (i < tmpl_len && (tmpl[i] == '0') && (i+1 < tmpl_len && (tmpl[i+1] == 'x' || tmpl[i+1] == 'X'))) {
+                i += 2;
+                uint8_t val = 0;
+                while (i < tmpl_len && isxdigit((unsigned char)tmpl[i])) {
+                    int d = gen_hexval(tmpl[i]);
+                    val = (val << 4) | d;
+                    i++;
+                }
+                cc_buf_push8(&g_text, val);
+            }
+            continue;
+        }
+        /* Named mnemonics. */
+        if ((tmpl[i] == 'n' || tmpl[i] == 'N') && i + 2 < tmpl_len &&
+            (tmpl[i+1] == 'o' || tmpl[i+1] == 'O') &&
+            (tmpl[i+2] == 'p' || tmpl[i+2] == 'P')) {
+            /* nop */
+            cc_buf_push8(&g_text, 0x13); cc_buf_push8(&g_text, 0x00);
+            cc_buf_push8(&g_text, 0x00); cc_buf_push8(&g_text, 0x00);
+            i += 3;
+            continue;
+        }
+        if ((tmpl[i] == 'e' || tmpl[i] == 'E') && i + 4 < tmpl_len &&
+            (tmpl[i+1] == 'c' || tmpl[i+1] == 'C') &&
+            (tmpl[i+2] == 'a' || tmpl[i+2] == 'A') &&
+            (tmpl[i+3] == 'l' || tmpl[i+3] == 'L') &&
+            (tmpl[i+4] == 'l' || tmpl[i+4] == 'L')) {
+            /* ecall */
+            cc_buf_push8(&g_text, 0x73); cc_buf_push8(&g_text, 0x00);
+            cc_buf_push8(&g_text, 0x00); cc_buf_push8(&g_text, 0x00);
+            i += 5;
+            continue;
+        }
+        if ((tmpl[i] == 'e' || tmpl[i] == 'E') && i + 5 < tmpl_len &&
+            (tmpl[i+1] == 'b' || tmpl[i+1] == 'B') &&
+            (tmpl[i+2] == 'r' || tmpl[i+2] == 'R') &&
+            (tmpl[i+3] == 'e' || tmpl[i+3] == 'E') &&
+            (tmpl[i+4] == 'a' || tmpl[i+4] == 'A') &&
+            (tmpl[i+5] == 'k' || tmpl[i+5] == 'K')) {
+            /* ebreak */
+            cc_buf_push8(&g_text, 0x73); cc_buf_push8(&g_text, 0x10);
+            cc_buf_push8(&g_text, 0x00); cc_buf_push8(&g_text, 0x00);
+            i += 6;
+            continue;
+        }
+        if ((tmpl[i] == 'f' || tmpl[i] == 'F') && i + 4 < tmpl_len &&
+            (tmpl[i+1] == 'e' || tmpl[i+1] == 'E') &&
+            (tmpl[i+2] == 'n' || tmpl[i+2] == 'N') &&
+            (tmpl[i+3] == 'c' || tmpl[i+3] == 'C') &&
+            (tmpl[i+4] == 'e' || tmpl[i+4] == 'E')) {
+            /* fence */
+            if (i + 5 < tmpl_len && (tmpl[i+5] == '.' || tmpl[i+5] == 'i' || tmpl[i+5] == 'I')) {
+                /* fence.i */
+                cc_buf_push8(&g_text, 0x0F); cc_buf_push8(&g_text, 0x00);
+                cc_buf_push8(&g_text, 0x10); cc_buf_push8(&g_text, 0x00);
+                i += 6;
+            } else {
+                cc_buf_push8(&g_text, 0x0F); cc_buf_push8(&g_text, 0x00);
+                cc_buf_push8(&g_text, 0xF0); cc_buf_push8(&g_text, 0x00);
+                i += 5;
+            }
+            continue;
+        }
+        /* Skip unknown characters until whitespace or next directive. */
+        i++;
+    }
+}
+
 static void parse_stmt(lexer_t *lx) {
     cc_pos_t pos = lx->cur.pos;
 
@@ -1695,6 +2075,7 @@ static void parse_stmt(lexer_t *lx) {
     switch (lx->cur.kind) {
         case T_SEMI: lex_next(lx); return;
         case T_LBRACE: parse_compound(lx); return;
+        case T_KW_ASM: parse_asm(lx); return;
         case T_KW_IF: {
             lex_next(lx);
             parse_expect(T_LPAREN, "expected '(' after if");
@@ -1779,7 +2160,12 @@ static void parse_stmt(lexer_t *lx) {
             lex_next(lx);
             if (lx->cur.kind != T_SEMI) {
                 val_t v = parse_expr(lx);
-                load_value(&v, RV_A0);
+                if (is_float_type(v.type)) {
+                    /* Return float/double in FA0 (float ABI convention). */
+                    load_float_value(&v, RV_FA0);
+                } else {
+                    load_value(&v, RV_A0);
+                }
             }
             parse_expect(T_SEMI, "expected ';'");
             /* Epilogue: restore fp, ra; dealloc stack; ret. */
