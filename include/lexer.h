@@ -46,6 +46,7 @@ typedef enum {
     T_KW_TRY, T_KW_CATCH, T_KW_THROW,
     /* Preprocessor passthrough */
     T_HASH, T_HASHHASH,
+    T_KW_ASM,    /* asm / __asm__ */
     /* Special */
     T_BUILTIN,   /* __builtin_onyx_* */
 } token_kind_t;

@@ -90,8 +90,8 @@ static const kw_entry_t kws[] = {
     {"__const__",     T_KW_CONST},
     {"__signed",      T_KW_SIGNED},
     {"__signed__",    T_KW_SIGNED},
-    {"asm",           T_IDENT},
-    {"__asm__",       T_IDENT},
+    {"asm",           T_KW_ASM},
+    {"__asm__",       T_KW_ASM},
 };
 
 #define N_KWS (int)(sizeof(kws) / sizeof(kws[0]))

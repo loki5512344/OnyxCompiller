@@ -1,5 +1,5 @@
 /*
- * riscv64.c — RISC-V (RV64IMA) instruction encoders.
+ * riscv64.c — RISC-V (RV64IMAFD) instruction encoders.
  *
  * Instructions are emitted little-endian into g_text. Branches and
  * jumps use label-based fixups resolved at function end.
@@ -258,14 +258,131 @@ void rv_not(int rd, int rs)   { rv_addi(rd, rs, -1); }
 void rv_seqz(int rd, int rs)  { rv_sltiu(rd, rs, 1); }
 void rv_snez(int rd, int rs)  { rv_sltu(rd, RV_ZERO, rs); }
 
+/* ---- F/D extension (float / double) --------------------------------- */
+
+/* General float R-type emitter (opcode = OP-FP = 0x53).
+ * funct7 and rs2 together specify the FPU operation; funct3 is the
+ * rounding mode (0=RNE, 1=RTZ, …). */
+void rv_emit_fpu_r(uint32_t funct7, int funct3, int rd, int rs1, int rs2) {
+    uint32_t insn = (funct7 & 0x7F) << 25
+                  | (uint32_t)(rs2 & 0x1F) << 20
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | (uint32_t)(funct3 & 0x7) << 12
+                  | (uint32_t)(rd & 0x1F) << 7
+                  | 0x53;
+    emit32(insn);
+}
+
+/* Load/store float/double. */
+void rv_flw(int rd, int rs1, int imm) {
+    uint32_t insn = (uint32_t)(imm & 0xFFF) << 20
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x2 << 12
+                  | (uint32_t)(rd & 0x1F) << 7
+                  | 0x07;
+    emit32(insn);
+}
+
+void rv_fld(int rd, int rs1, int imm) {
+    uint32_t insn = (uint32_t)(imm & 0xFFF) << 20
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x3 << 12
+                  | (uint32_t)(rd & 0x1F) << 7
+                  | 0x07;
+    emit32(insn);
+}
+
+void rv_fsw(int rs2, int rs1, int imm) {
+    uint32_t imm_lo = (uint32_t)(imm & 0x1F);
+    uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
+    uint32_t insn = imm_hi << 25
+                  | (uint32_t)(rs2 & 0x1F) << 20
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x2 << 12
+                  | imm_lo << 7
+                  | 0x27;
+    emit32(insn);
+}
+
+void rv_fsd(int rs2, int rs1, int imm) {
+    uint32_t imm_lo = (uint32_t)(imm & 0x1F);
+    uint32_t imm_hi = (uint32_t)((imm >> 5) & 0x7F);
+    uint32_t insn = imm_hi << 25
+                  | (uint32_t)(rs2 & 0x1F) << 20
+                  | (uint32_t)(rs1 & 0x1F) << 15
+                  | 0x3 << 12
+                  | imm_lo << 7
+                  | 0x27;
+    emit32(insn);
+}
+
+/* Arithmetic — single-precision. funct3=0 (RNE). */
+void rv_fadd_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x00, 0x0, rd, rs1, rs2); }
+void rv_fsub_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x08, 0x0, rd, rs1, rs2); }
+void rv_fmul_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x10, 0x0, rd, rs1, rs2); }
+void rv_fdiv_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x18, 0x0, rd, rs1, rs2); }
+
+/* Arithmetic — double-precision. funct3=1 (RNE for double). */
+void rv_fadd_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x00, 0x1, rd, rs1, rs2); }
+void rv_fsub_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x08, 0x1, rd, rs1, rs2); }
+void rv_fmul_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x10, 0x1, rd, rs1, rs2); }
+void rv_fdiv_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x18, 0x1, rd, rs1, rs2); }
+
+/* Move between int and float register files. */
+void rv_fmv_w_x(int rd, int rs1) { rv_emit_fpu_r(0xF8, 0x0, rd, rs1, 0); }
+void rv_fmv_x_w(int rd, int rs1) { rv_emit_fpu_r(0xE0, 0x0, rd, rs1, 0); }
+void rv_fmv_d_x(int rd, int rs1) { rv_emit_fpu_r(0xF2, 0x0, rd, rs1, 0); }
+void rv_fmv_x_d(int rd, int rs1) { rv_emit_fpu_r(0xE2, 0x1, rd, rs1, 0); }
+
+/* Conversions — verified against Spike riscv/encoding.h MATCH_* constants.
+ *   fcvt.s.l: funct7=0x68, rs2=0x2, funct3=0 (RNE)
+ *   fcvt.l.s: funct7=0x60, rs2=0x2, funct3=1 (RTZ)
+ *   fcvt.d.l: funct7=0x69, rs2=0x2, funct3=0 (RNE)
+ *   fcvt.l.d: funct7=0x61, rs2=0x2, funct3=1 (RTZ)
+ *   fcvt.s.d: funct7=0x20, rs2=0x1, funct3=0 (RNE)
+ *   fcvt.d.s: funct7=0x21, rs2=0x0, funct3=0 (RNE)
+ *   fcvt.s.w: funct7=0x68, rs2=0x0, funct3=0 (RNE)
+ *   fcvt.w.s: funct7=0x60, rs2=0x0, funct3=1 (RTZ)
+ */
+void rv_fcvt_s_l(int rd, int rs1) { rv_emit_fpu_r(0x68, 0x0, rd, rs1, 0x2); }
+void rv_fcvt_l_s(int rd, int rs1) { rv_emit_fpu_r(0x60, 0x1, rd, rs1, 0x2); }
+void rv_fcvt_d_l(int rd, int rs1) { rv_emit_fpu_r(0x69, 0x0, rd, rs1, 0x2); }
+void rv_fcvt_l_d(int rd, int rs1) { rv_emit_fpu_r(0x61, 0x1, rd, rs1, 0x2); }
+void rv_fcvt_s_d(int rd, int rs1) { rv_emit_fpu_r(0x20, 0x0, rd, rs1, 0x1); }
+void rv_fcvt_d_s(int rd, int rs1) { rv_emit_fpu_r(0x21, 0x0, rd, rs1, 0x0); }
+void rv_fcvt_s_w(int rd, int rs1) { rv_emit_fpu_r(0x68, 0x0, rd, rs1, 0x0); }
+void rv_fcvt_w_s(int rd, int rs1) { rv_emit_fpu_r(0x60, 0x1, rd, rs1, 0x0); }
+
+/* Comparisons — single-precision. rd is an int register.
+ *   feq.s: funct7=0x50, funct3=0x2
+ *   flt.s: funct7=0x50, funct3=0x1
+ *   fle.s: funct7=0x50, funct3=0x0
+ */
+void rv_feq_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x50, 0x2, rd, rs1, rs2); }
+void rv_flt_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x50, 0x1, rd, rs1, rs2); }
+void rv_fle_s(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x50, 0x0, rd, rs1, rs2); }
+
+/* Comparisons — double-precision.
+ *   feq.d: funct7=0x51, funct3=0x2
+ *   flt.d: funct7=0x51, funct3=0x1
+ *   fle.d: funct7=0x51, funct3=0x0
+ */
+void rv_feq_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x51, 0x2, rd, rs1, rs2); }
+void rv_flt_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x51, 0x1, rd, rs1, rs2); }
+void rv_fle_d(int rd, int rs1, int rs2) { rv_emit_fpu_r(0x51, 0x0, rd, rs1, rs2); }
+
+/* Float neg — flip sign bit via fsgnjn.
+ *   fneg.s rd, rs = fsgnjn.s rd, rs, rs (funct7=0x10, funct3=0x1)
+ *   fneg.d rd, rs = fsgnjn.d rd, rs, rs (funct7=0x11, funct3=0x1)
+ */
+void rv_fneg_s(int rd, int rs1) { rv_emit_fpu_r(0x10, 0x1, rd, rs1, rs1); }
+void rv_fneg_d(int rd, int rs1) { rv_emit_fpu_r(0x11, 0x1, rd, rs1, rs1); }
+
+/* ---- Branch / label helpers (unchanged from IMA) --------------------- */
+
 /* Token-based branch (used by codegen for if/while conditions). */
 void rv_branch(int rs1, int rs2, int op_token, uint32_t *label_out) {
-    /* op_token is the token_kind_t of the relational operator. We branch
-     * when the condition is FALSE so the codegen can fall through to
-     * the 'then' branch. Caller must invert as needed. */
-    /* For our codegen we use: 'branch if true to label'. */
     uint32_t patch = (uint32_t)g_text.size;
-    /* Patch target = *label_out (set later if known). */
     int32_t target = (int32_t)*label_out;
     int32_t delta = target - (int32_t)patch;
     switch (op_token) {
@@ -276,14 +393,11 @@ void rv_branch(int rs1, int rs2, int op_token, uint32_t *label_out) {
         case T_LE: rv_bge(rs2, rs1, delta); break;
         case T_GE: rv_bge(rs1, rs2, delta); break;
         default:
-            /* Non-relational: assume 'is non-zero'. */
             rv_bne(rs1, rs2, delta);
             break;
     }
     if (target == 0) {
-        /* Forward reference; record fixup. */
         new_fixup(FX_BRANCH, patch, 0);
-        /* Store patch_off in label so we can fix it later. */
         *label_out = patch;
     }
 }

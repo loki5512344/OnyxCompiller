@@ -44,6 +44,7 @@ typedef struct {
     type_t *type;
     int reg;
     int64_t imm;
+    double fval;     /* for float/double constants */
     int sym_idx;     /* for VAL_SYM */
     int64_t offset;  /* for VAL_SYM/VAL_LVAL */
 } val_t;
@@ -196,6 +197,102 @@ static void load_value(val_t *v, int reg) {
         }
         v->kind = VAL_REG;
         v->offset = 0;
+    }
+}
+
+/* Helper: is this a float/double type? */
+static bool is_float_type(type_t *t) {
+    return t && (t->kind == TY_FLOAT || t->kind == TY_DOUBLE || t->kind == TY_LDOUBLE);
+}
+
+/* Materialize a float/double constant into FT0.
+ * Strategy: store the bit pattern as an integer constant, load into
+ * an int reg, then fmv.w.x (float) or fmv.d.x (double) to move to
+ * float reg. For double, we need two lui+addi for the 64-bit pattern,
+ * then fmv.d.x.
+ * For simplicity, we put the constant in rodata and load via fld/flw.
+ */
+static void materialize_float_const(val_t *v, int freg) {
+    bool is_double = (v->type && v->type->kind == TY_DOUBLE) || v->type->kind == TY_LDOUBLE;
+    /* Write the float constant to rodata. */
+    uint32_t rodata_off = (uint32_t)g_rodata.size;
+    if (is_double) {
+        uint64_t bits;
+        memcpy(&bits, &v->fval, 8);
+        cc_buf_push8(&g_rodata, bits & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 8) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 16) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 24) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 32) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 40) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 48) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 56) & 0xFF);
+    } else {
+        float fv = (float)v->fval;
+        uint32_t bits;
+        memcpy(&bits, &fv, 4);
+        cc_buf_push8(&g_rodata, bits & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 8) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 16) & 0xFF);
+        cc_buf_push8(&g_rodata, (bits >> 24) & 0xFF);
+    }
+    /* Emit lui+addi for the rodata address; record fixup. */
+    uint32_t lui_off = (uint32_t)g_text.size;
+    rv_lui(RV_T0, 0);
+    uint32_t addi_off = (uint32_t)g_text.size;
+    rv_addi(RV_T0, RV_T0, (int)rodata_off);
+    if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata refs");
+    g_rodata_fixups[g_n_rodata_fixups].rodata_off = rodata_off;
+    g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
+    g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
+    g_n_rodata_fixups++;
+    /* Load float value from rodata address. */
+    if (is_double) {
+        rv_fld(freg, RV_T0, 0);
+    } else {
+        rv_flw(freg, RV_T0, 0);
+    }
+    v->kind = VAL_REG;
+    v->reg = freg;
+    v->offset = 0;
+}
+
+/* Load a float value (like load_value but uses float registers). */
+static void load_float_value(val_t *v, int freg) {
+    if (v->kind == VAL_IMM && is_float_type(v->type)) {
+        /* Float constant — materialize via rodata. */
+        materialize_float_const(v, freg);
+        return;
+    }
+    /* For LVAL/SYM: materialize address, then flw/fld. */
+    materialize(v, RV_T0);
+    if (v->kind == VAL_LVAL) {
+        bool is_double = v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE);
+        if (is_double) {
+            rv_fld(freg, RV_T0, (int)v->offset);
+        } else {
+            rv_flw(freg, RV_T0, (int)v->offset);
+        }
+        v->kind = VAL_REG;
+        v->reg = freg;
+        v->offset = 0;
+        return;
+    }
+    if (v->kind == VAL_REG) {
+        /* Already in a register. If it's an int reg, we need to convert. */
+        if (!is_float_type(v->type) && is_float_type(v->type)) {
+            /* Should not happen normally. */
+        }
+        if (v->reg != freg) {
+            /* Move between float regs: use fsgnj (fmv within float file). */
+            /* fsgnj.s: funct7=0x10, funct3=0x0 — copy sign from rs1 */
+            if (v->type && (v->type->kind == TY_DOUBLE || v->type->kind == TY_LDOUBLE)) {
+                rv_emit_fpu_r(0x11, 0x0, freg, v->reg, v->reg); /* fsgnj.d */
+            } else {
+                rv_emit_fpu_r(0x10, 0x0, freg, v->reg, v->reg); /* fsgnj.s */
+            }
+            v->reg = freg;
+        }
     }
 }
 
@@ -628,6 +725,13 @@ static val_t parse_primary(lexer_t *lx) {
             lex_next(lx);
             return v;
         }
+        case T_FLOAT: case T_DOUBLE: {
+            v.kind = VAL_IMM;
+            v.fval = lx->cur.fval;
+            v.type = (lx->cur.kind == T_FLOAT) ? &ty_float : &ty_double;
+            lex_next(lx);
+            return v;
+        }
         case T_STRING: {
             /* Allocate in rodata; load address into T0 and return VAL_REG. */
             uint32_t off = cc_strpool_add(lx->cur.str, lx->cur.str_len);
@@ -665,7 +769,55 @@ static val_t parse_primary(lexer_t *lx) {
                     while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
                 }
                 parse_expect(T_RPAREN, "expected ')' after cast");
-                /* Could be compound literal { ... } — not supported. */
+                /* Compound literal: (type){ init_list } */
+                if (lx->cur.kind == T_LBRACE) {
+                    /* Allocate stack space for the type. */
+                    uint64_t sz = type_sizeof(t);
+                    uint64_t al = type_alignof(t);
+                    g_func.cur_offset += sz;
+                    g_func.cur_offset = (g_func.cur_offset + al - 1) & ~(al - 1);
+                    int64_t off = -(int64_t)g_func.cur_offset;
+                    if (g_func.cur_offset > g_func.frame_size)
+                        g_func.frame_size = g_func.cur_offset;
+                    /* Compute address of stack slot. */
+                    rv_addi(RV_T0, RV_FP, (int)off);
+                    /* Parse initializer list and emit stores. */
+                    lex_next(lx); /* consume '{' */
+                    int field_idx = 0;
+                    while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
+                        val_t elem = parse_assign(lx);
+                        /* Store element at appropriate offset within the struct/array. */
+                        uint64_t elem_off = 0;
+                        if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
+                            /* Walk struct fields to find offset. */
+                            type_t *st = t;
+                            if (st->n_fields > 0 && field_idx < st->n_fields) {
+                                elem_off = st->fields[field_idx].offset;
+                            }
+                        } else if (t->kind == TY_ARRAY) {
+                            uint64_t elem_sz = type_sizeof(t->base);
+                            elem_off = field_idx * elem_sz;
+                        }
+                        /* Store the element. */
+                        load_value(&elem, RV_T1);
+                        rv_addi(RV_T2, RV_T0, (int)elem_off);
+                        uint64_t elem_sz = type_sizeof(elem.type);
+                        switch (elem_sz) {
+                            case 1: rv_sb(RV_T1, RV_T2, 0); break;
+                            case 2: rv_sh(RV_T1, RV_T2, 0); break;
+                            case 4: rv_sw(RV_T1, RV_T2, 0); break;
+                            default: rv_sd(RV_T1, RV_T2, 0); break;
+                        }
+                        field_idx++;
+                        if (!accept(T_COMMA)) break;
+                    }
+                    parse_expect(T_RBRACE, "expected '}' after compound literal");
+                    v.kind = VAL_LVAL;
+                    v.reg = RV_T0;
+                    v.offset = 0;
+                    v.type = t;
+                    return v;
+                }
                 val_t e = parse_unary(lx);
                 load_value(&e, RV_T0);
                 /* Cast: truncate / extend based on target type. */
