@@ -23,6 +23,8 @@ typedef struct {
     int switch_depth;
     uint32_t break_fixups[256];
     int n_break_fixups;
+    uint32_t continue_fixups[256];
+    int n_continue_fixups;
     bool in_function;
 } gen_func_t;
 

@@ -536,6 +536,15 @@ typedef struct {
 static rodata_fixup_t g_rodata_fixups[4096];
 static int g_n_rodata_fixups = 0;
 
+/* Fixups for global data pointing to rodata (string initializers). */
+typedef struct {
+    uint32_t rodata_off;   /* offset within rodata */
+    uint32_t data_off;     /* offset within g_data to patch (8 bytes, LE) */
+} data_rodata_fixup_t;
+
+static data_rodata_fixup_t g_data_rodata_fixups[4096];
+static int g_n_data_rodata_fixups = 0;
+
 /* Emit a global address load into `reg`. Records a fixup for later. */
 static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off) {
     uint32_t lui_off = (uint32_t)g_text.size;
@@ -554,7 +563,7 @@ static void emit_load_global_addr(int reg, int sym_idx, int64_t add_off) {
 }
 
 /* ---- Function call codegen ------------------------------------------ */
-static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type) {
+static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type, val_t *callee) {
     /* Parse args. We evaluate args left-to-right into a0-a7 (max 8).
      * Extra args go on the stack. */
     parse_expect(T_LPAREN, "expected '('");
@@ -580,15 +589,17 @@ static val_t gen_call(lexer_t *lx, int fn_sym_idx, type_t *fn_type) {
     if (nargs > g_func.max_call_args) g_func.max_call_args = nargs;
 
     /* Indirect call vs direct call. */
-    if (fn_sym_idx >= 0) {
-        sym_t *s = &g_globals[fn_sym_idx];
+    if (callee && (callee->kind == VAL_REG || callee->kind == VAL_LVAL || callee->kind == VAL_SYM)) {
+        /* Indirect call through function pointer. */
+        val_t cv = *callee;
+        load_value(&cv, RV_T5);
+        rv_jalr(RV_RA, RV_T5, 0);
+    } else if (fn_sym_idx >= 0) {
         /* Direct call: auipc + jalr with offset 0.
-         * For MVP, emit jal placeholder; we patch with auipc+jalr in finalize. */
-        /* Use t0 as scratch: la t0, sym; jalr ra, t0, 0. */
+         * Use t0 as scratch: la t0, sym; jalr ra, t0, 0. */
         emit_load_global_addr(RV_T0, fn_sym_idx, 0);
         rv_jalr(RV_RA, RV_T0, 0);
     } else {
-        /* Indirect call: address already in a0 (from parse_primary). */
         cc_error("indirect calls not yet supported");
     }
 
@@ -771,7 +782,34 @@ static val_t parse_primary(lexer_t *lx) {
                     memset(&vr, 0, sizeof(vr));
                     return vr;
                 }
+                /* Check local symbols first (e.g. local function pointer). */
+                int lidx = symtab_lookup_local(name);
+                if (lidx >= 0 && g_locals[lidx].type->kind == TY_PTR &&
+                    g_locals[lidx].type->base && g_locals[lidx].type->base->kind == TY_FUNC) {
+                    /* Indirect call through local function pointer. */
+                    type_t *ft = g_locals[lidx].type->base;
+                    val_t callee;
+                    memset(&callee, 0, sizeof(callee));
+                    callee.kind = VAL_SYM;
+                    callee.sym_idx = g_n_globals + lidx;
+                    callee.type = g_locals[lidx].type;
+                    return gen_call(lx, -1, ft, &callee);
+                }
+
                 int idx = symtab_lookup_global(name);
+                if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
+                    g_globals[idx].type->kind == TY_PTR &&
+                    g_globals[idx].type->base && g_globals[idx].type->base->kind == TY_FUNC) {
+                    /* Indirect call through global function pointer variable. */
+                    type_t *ft = g_globals[idx].type->base;
+                    val_t callee;
+                    memset(&callee, 0, sizeof(callee));
+                    callee.kind = VAL_SYM;
+                    callee.sym_idx = idx;
+                    callee.type = g_globals[idx].type;
+                    return gen_call(lx, -1, ft, &callee);
+                }
+
                 if (idx < 0) {
                     /* Implicit declaration of function — assume int(). */
                     type_t *ft = (type_t *)cc_arena_alloc(&g_type_arena, sizeof(type_t), 8);
@@ -783,7 +821,7 @@ static val_t parse_primary(lexer_t *lx) {
                     g_globals[idx].is_defined = false;
                 }
                 type_t *ft = g_globals[idx].type;
-                return gen_call(lx, idx, ft);
+                return gen_call(lx, idx, ft, NULL);
             }
 
             /* Variable / enum const. */
@@ -882,6 +920,20 @@ static val_t parse_primary(lexer_t *lx) {
                     }
                     v.type = st->fields[fi].type;
                     continue;
+                }
+                if (lx->cur.kind == T_LPAREN) {
+                    /* Postfix call on a value: e.g. func_ptr(args), arr[i](args). */
+                    type_t *ft = NULL;
+                    if (v.type->kind == TY_PTR && v.type->base && v.type->base->kind == TY_FUNC) {
+                        ft = v.type->base;
+                    } else if (v.type->kind == TY_FUNC) {
+                        ft = v.type;
+                    }
+                    if (!ft) {
+                        cc_error("called object is not a function or function pointer");
+                        break;
+                    }
+                    return gen_call(lx, -1, ft, &v);
                 }
                 if (lx->cur.kind == T_INC || lx->cur.kind == T_DEC) {
                     int op = lx->cur.kind;
@@ -1543,6 +1595,7 @@ static void parse_stmt(lexer_t *lx) {
             rv_beq(RV_T0, RV_ZERO, 0);
             uint32_t br_off = (uint32_t)g_text.size - 4;
             int saved_n_break = g_func.n_break_fixups;
+            int saved_n_cont = g_func.n_continue_fixups;
             uint32_t saved_break = g_func.break_label;
             uint32_t saved_continue = g_func.continue_label;
             g_func.break_label = 0;
@@ -1560,7 +1613,12 @@ static void parse_stmt(lexer_t *lx) {
             /* Patch break fixups. */
             for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
                 patch_jal(g_func.break_fixups[i], (int32_t)end_label - (int32_t)g_func.break_fixups[i]);
+            /* Patch continue fixups (shouldn't be any for while since
+             * continue_label is known, but handle for safety). */
+            for (int i = saved_n_cont; i < g_func.n_continue_fixups; i++)
+                patch_jal(g_func.continue_fixups[i], (int32_t)cond_label - (int32_t)g_func.continue_fixups[i]);
             g_func.n_break_fixups = saved_n_break;
+            g_func.n_continue_fixups = saved_n_cont;
             g_func.break_label = saved_break;
             g_func.continue_label = saved_continue;
             return;
@@ -1595,7 +1653,21 @@ static void parse_stmt(lexer_t *lx) {
         case T_KW_CONTINUE:
             lex_next(lx);
             parse_expect(T_SEMI, "expected ';'");
-            cc_warn("'continue' not fully supported in MVP");
+            if (g_func.loop_depth == 0) {
+                cc_error("'continue' outside loop");
+                return;
+            }
+            rv_jal(RV_ZERO, 0);
+            {
+                uint32_t cont_off = (uint32_t)g_text.size - 4;
+                if (g_func.continue_label != 0) {
+                    /* Target already known (e.g. while loop) — patch directly. */
+                    patch_jal(cont_off, (int32_t)g_func.continue_label - (int32_t)cont_off);
+                } else {
+                    /* Target not yet known (e.g. for loop post-expr) — add fixup. */
+                    g_func.continue_fixups[g_func.n_continue_fixups++] = cont_off;
+                }
+            }
             return;
         case T_KW_GOTO: {
             lex_next(lx);
@@ -1612,7 +1684,11 @@ static void parse_stmt(lexer_t *lx) {
             return;
         }
         case T_KW_FOR: {
-            /* for(init; cond; post) body — desugar to while. */
+            /* for(init; cond; post) body — single-pass codegen.
+             * Emit: init → cond → [branch if !cond to end] → body → post → jump to cond.
+             * The post-expression is skipped during initial lexing (source range
+             * saved), then re-lexed and parsed after the body so its code is
+             * emitted in the correct position. */
             lex_next(lx);
             parse_expect(T_LPAREN, "expected '(' after for");
             symtab_push_scope();
@@ -1635,16 +1711,9 @@ static void parse_stmt(lexer_t *lx) {
                 rv_beq(RV_T0, RV_ZERO, 0);
             }
             uint32_t br_off = has_cond ? (uint32_t)g_text.size - 4 : 0;
-            /* post: parse but emit AFTER body. */
-            /* Save position and parse post-expr into a buffer? For MVP we
-             * evaluate post inline. */
-            /* We need to skip post during initial codegen, emit body, then
-             * emit post. Tricky without a buffer. Simplest: emit body, then
-             * post, then jump back to cond. */
-            /* Save lexer state of post expr as raw source range. */
-            const char *post_start = lx->src + lx->pos;
+
+            /* Save post-expression source range, then skip it. */
             size_t post_start_off = lx->pos;
-            /* Skip post expr. */
             int paren = 0;
             while (lx->cur.kind != T_RPAREN || paren > 0) {
                 if (lx->cur.kind == T_LPAREN) paren++;
@@ -1656,14 +1725,35 @@ static void parse_stmt(lexer_t *lx) {
             parse_expect(T_RPAREN, "expected ')'");
 
             int saved_n_break = g_func.n_break_fixups;
+            int saved_n_cont = g_func.n_continue_fixups;
             uint32_t saved_break = g_func.break_label;
+            uint32_t saved_continue = g_func.continue_label;
             g_func.break_label = 0;
+            /* continue_label is not known yet (post-expr hasn't been emitted),
+             * so set to 0 to signal that continue fixups are needed. */
+            g_func.continue_label = 0;
             g_func.loop_depth++;
             parse_stmt(lx);
 
-            /* Re-evaluate post by lexing the substring. */
-            /* For MVP we'll skip re-eval; just jump back. */
-            (void)post_start; (void)post_start_off; (void)post_end_off;
+            /* Continue target: emit post-expression here. */
+            uint32_t post_label = (uint32_t)g_text.size;
+            if (post_end_off > post_start_off) {
+                /* Re-lex and parse the post-expression from the saved source
+                 * range using a temporary lexer.  The symbol table is shared
+                 * (global state) so variable lookups still work.
+                 * We must also swap g_lx because parse_error/parse_expect/
+                 * accept use the global lexer pointer. */
+                lexer_t post_lx;
+                lexer_t *saved_g_lx = g_lx;
+                lex_init(&post_lx, lx->src + post_start_off,
+                         post_end_off - post_start_off, lx->filename);
+                lex_next(&post_lx);
+                g_lx = &post_lx;
+                val_t pv = parse_expr(&post_lx);
+                (void)pv;
+                g_lx = saved_g_lx;
+            }
+
             rv_jal(RV_ZERO, 0);
             uint32_t jmp_off = (uint32_t)g_text.size - 4;
             uint32_t end_label = (uint32_t)g_text.size;
@@ -1672,10 +1762,16 @@ static void parse_stmt(lexer_t *lx) {
             if (has_cond)
                 patch_branch(br_off, (int32_t)end_label - (int32_t)br_off);
             patch_jal(jmp_off, (int32_t)cond_label - (int32_t)jmp_off);
+            /* Patch break fixups → end_label. */
             for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
                 patch_jal(g_func.break_fixups[i], (int32_t)end_label - (int32_t)g_func.break_fixups[i]);
+            /* Patch continue fixups → post_label. */
+            for (int i = saved_n_cont; i < g_func.n_continue_fixups; i++)
+                patch_jal(g_func.continue_fixups[i], (int32_t)post_label - (int32_t)g_func.continue_fixups[i]);
             g_func.n_break_fixups = saved_n_break;
+            g_func.n_continue_fixups = saved_n_cont;
             g_func.break_label = saved_break;
+            g_func.continue_label = saved_continue;
             symtab_pop_scope();
             return;
         }
@@ -1745,7 +1841,20 @@ static void parse_compound(lexer_t *lx) {
 
 /* ---- Global init parser (constant only) ---------------------------- */
 expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
-    /* For MVP: support only integer/pointer constants. */
+    /* Support string literal initializers: char *s = "hello"; char s[] = "hello" */
+    if (lx->cur.kind == T_STRING) {
+        /* Add string to rodata pool. */
+        uint32_t off = cc_strpool_add(lx->cur.str, lx->cur.str_len);
+        size_t slen = lx->cur.str_len;  /* length without null terminator */
+        lex_next(lx);
+        /* Create an EX_STR node; ival holds the rodata offset, str_len the byte count. */
+        expr_t *e = ast_new_expr(EX_STR, lx->cur.pos);
+        e->ival = off;
+        e->str_len = slen;
+        return e;
+    }
+
+    /* For non-string: support only integer/pointer constants. */
     val_t v = parse_assign(lx);
     expr_t *e = ast_new_expr(EX_NUM, lx->cur.pos);
     if (v.kind == VAL_IMM) {
@@ -1767,6 +1876,8 @@ static void gen_func_body(lexer_t *lx, decl_t *d) {
     g_func.cur_offset = 16;
     g_func.max_call_args = 0;
     g_func.loop_depth = 0;
+    g_func.n_break_fixups = 0;
+    g_func.n_continue_fixups = 0;
     g_func.in_function = true;
     g_func.nparams = ftype->nparams;
     g_func.is_variadic = ftype->is_varargs;
@@ -1895,14 +2006,52 @@ void gen_decl(decl_t *d) {
         case D_VAR: {
             int idx = symtab_install_global(d->name, SYM_GLOBAL_VAR, d->type);
             if (d->init) {
-                /* For MVP: only zero-init or constant. */
                 if (d->init->kind == EX_NUM) {
+                    /* Integer/pointer constant initializer. */
                     uint64_t v = d->init->ival;
                     g_globals[idx].is_defined = true;
                     g_globals[idx].text_off = (uint32_t)g_data.size;
                     uint64_t sz = type_sizeof(d->type);
                     for (uint64_t i = 0; i < sz; i++) {
                         cc_buf_push8(&g_data, (uint8_t)(v >> (8 * i)));
+                    }
+                } else if (d->init->kind == EX_STR) {
+                    /* String literal initializer: char *s = "hello" or char s[] = "hello". */
+                    uint32_t rodata_off = (uint32_t)d->init->ival;
+                    g_globals[idx].is_defined = true;
+                    g_globals[idx].text_off = (uint32_t)g_data.size;
+                    if (d->type->kind == TY_PTR) {
+                        /* char *s = "hello" → store the address of the string.
+                         * Write placeholder 0; patched in gen_finalize with rodata address. */
+                        uint32_t data_off = (uint32_t)g_data.size;
+                        cc_buf_push64(&g_data, 0);
+                        /* Record fixup so gen_finalize can patch the address. */
+                        if (g_n_data_rodata_fixups >= 4096)
+                            cc_fatal("too many data-rodata fixups");
+                        g_data_rodata_fixups[g_n_data_rodata_fixups].rodata_off = rodata_off;
+                        g_data_rodata_fixups[g_n_data_rodata_fixups].data_off = data_off;
+                        g_n_data_rodata_fixups++;
+                    } else if (d->type->kind == TY_ARRAY) {
+                        /* char s[] = "hello" → copy string bytes (with NUL) into .data. */
+                        size_t slen = d->init->str_len + 1; /* include NUL terminator */
+                        cc_buf_push(&g_data, g_rodata.data + rodata_off, slen);
+                        /* Pad to array size if specified and larger than string. */
+                        if (d->type->length > 0 && !d->type->is_incomplete) {
+                            uint64_t sz = type_sizeof(d->type);
+                            while (slen < sz) {
+                                cc_buf_push8(&g_data, 0);
+                                slen++;
+                            }
+                        } else if (d->type->is_incomplete || d->type->length == 0) {
+                            /* Incomplete array type (char s[] = "hello"): complete it
+                             * from the string length so the symbol size is correct. */
+                            d->type->length = slen;
+                            d->type->is_incomplete = false;
+                            d->type->is_complete = true;
+                            d->type->size = slen;
+                        }
+                    } else {
+                        cc_error("string initializer for non-pointer/non-array type");
                     }
                 }
             } else {
@@ -1982,6 +2131,16 @@ void gen_finalize(const char *entry_sym) {
         i2 &= ~0xFFF00000;
         i2 |= ((uint32_t)(lo & 0xFFF)) << 20;
         q[0] = i2 & 0xff; q[1] = (i2 >> 8) & 0xff; q[2] = (i2 >> 16) & 0xff; q[3] = (i2 >> 24) & 0xff;
+    }
+
+    /* Patch data-rodata fixups (global string initializers, e.g. char *s = "hello"). */
+    for (int i = 0; i < g_n_data_rodata_fixups; i++) {
+        data_rodata_fixup_t *f = &g_data_rodata_fixups[i];
+        uint64_t addr = rodata_vaddr + f->rodata_off;
+        /* Write 8-byte little-endian address into g_data at data_off. */
+        for (int j = 0; j < 8; j++) {
+            g_data.data[f->data_off + j] = (uint8_t)(addr >> (8 * j));
+        }
     }
 
     /* Determine entry point. */
