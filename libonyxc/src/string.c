@@ -71,3 +71,24 @@ int memcmp(const void *a, const void *b, size_t n) {
     }
     return 0;
 }
+
+void *memmove(void *d, const void *s, size_t n) {
+    unsigned char *dp = (unsigned char *)d;
+    const unsigned char *sp = (const unsigned char *)s;
+    if (dp == sp || n == 0) return d;
+    /* Copy forward if dst < src; backward if dst > src (overlap). */
+    if (dp < sp) {
+        for (size_t i = 0; i < n; i++) dp[i] = sp[i];
+    } else {
+        for (size_t i = n; i > 0; i--) dp[i - 1] = sp[i - 1];
+    }
+    return d;
+}
+
+char *strdup(const char *s) {
+    size_t len = strlen(s);
+    char *p = malloc(len + 1);
+    if (!p) return NULL;
+    memcpy(p, s, len + 1);
+    return p;
+}

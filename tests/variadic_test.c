@@ -14,6 +14,11 @@ int sum(int n, ...) {
 
 void _start() {
     int r = sum(3, 10, 20, 30);
-    /* r should be 60 */
-    __ecall1(93, r);
+    /* r should be 60.
+     *
+     * FIX (v0.4): previously used __ecall1(93, r) — syscall 93 is Linux's
+     * RISC-V exit, NOT OnyxOS's SYS_exit (which is 3). OnyxOS returned
+     * -ENOSYS and the process hung. We now use _onyx_exit() which correctly
+     * issues SYS_exit with the code in a0. */
+    _onyx_exit(r);
 }

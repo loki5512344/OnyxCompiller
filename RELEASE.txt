@@ -101,12 +101,66 @@ C/C++ → RISC-V64 → .onx компилятор для OnyxOS.
 ПОДДЕРЖКА OnyxKernel
 --------------------
 
-Этот релиз совместим с OnyxKernel v0.3 (формат .onx v1, 31 syscall,
+Этот релиз совместим с OnyxKernel v0.4 (формат .onx v1/v2, 77 syscall,
 ring-модель 0/1/2). Тесты валидации:
 - onyxcc_compat.rs — парсит hello_full.onx через OnyxHeader::from_bytes()
 - onyxcc_self.rs   — парсит onyxcc.onx
 
 Оба теста проходят с OnyxKernel/core/tests/.
+
+ЧТО НОВОГО В v0.4 (libonyxc)
+-----------------------------
+
+1. include/syscalls.h расширен — добавлены syscall'ы 32–49 (раньше не были
+   видны пользователю) и 28 новых syscall'ов v0.4 (50–77):
+   fstat, waitpid, getdents64, ioctl, mprotect, sigaction/sigprocmask/
+   sigreturn, execve, fork, clock_gettime/clock_getres, isatty,
+   getentropy, setuid/setgid, fsync, truncate2/ftruncate, readlink/symlink,
+   chmod/fchmod, getdents.
+
+2. Добавлены 4-, 5-, 6-аргументные варианты _onyx_syscall4/5/6 — нужны для
+   mmap (6 аргументов) и других многоаргументных syscall'ов.
+
+3. libonyxc/src/syscalls.c — добавлены _onyx_* wrappers для всех новых
+   syscall'ов. Теперь libc-функции (stat/fork/sigaction/...) могут
+   использовать их напрямую.
+
+4. libonyxc/src/start.c — теперь читает argc/argv/envp из a0/a1 и передаёт
+   в main(int argc, char **argv). Экспортирует `environ` для getenv().
+   Совместим со старым контрактом "a0=0" (синтезирует argv[0]="onyx-program").
+
+5. libonyxc/src/stdlib.c — исправлен критический баг в malloc: проверка
+   ошибки sbrk сравнивалась с -1 как с указателем, но ядро возвращало
+   отрицательное errno. Теперь _onyx_sbrk нормализует ошибки к (void*)-1,
+   и stdlib.c проверяет корректно.
+
+6. libonyxc/src/stdlib.c — добавлены getenv(), setenv(), unsetenv(),
+   abort(), abs().
+
+7. libonyxc/src/string.c — добавлены memmove() и strdup().
+
+8. libonyxc/include/onyxc.h — добавлены объявления для struct stat,
+   struct timeval, struct timespec, struct sigaction, всех новых _onyx_*
+   wrappers, статических инлайн-обёрток (open/close/read/write/lseek/
+   stat/fstat/unlink/chdir/getcwd/isatty/fork/execv/execve/getpid/
+   getppid/getuid/getgid/dup/pipe/fcntl/ioctl/sbrk/kill/raise/sigaction/
+   sigprocmask), и stdlib-функций (getenv/setenv/unsetenv/abort/abs).
+
+9. tests/variadic_test.c — исправлен баг: использовался syscall 93
+   (Linux exit) вместо OnyxOS SYS_exit (3). Тест теперь использует
+   _onyx_exit() напрямую.
+
+10. tests/hello_full.c — исправлен баг в exit_proc(): вызов __ecall1(SYS_exit)
+    не передавал exit code в a0. Теперь используется __ecall2(SYS_exit, code).
+
+СОВМЕСТИМОСТЬ
+-------------
+
+v0.4 обратно совместим с v0.3:
+- Старые бинарники (без argc/argv) продолжат работать — _start в start.c
+  определяет argc=0 и синтезирует argv[0]="onyx-program".
+- Старые syscall-номера 1–49 не изменились.
+- Заголовок .onx v1 поддерживается как и раньше.
 
 ЛИЦЕНЗИЯ
 --------

@@ -43,7 +43,11 @@ static void put_udec(int fd, unsigned long v) {
 }
 
 static void exit_proc(int code) {
-    __ecall1(SYS_exit);
+    /* FIX (v0.4): previously called __ecall1(SYS_exit) which only loads a7
+     * with the syscall number — a0 was left as whatever garbage was in the
+     * register, so the kernel recorded a random exit code. We now use
+     * __ecall2(SYS_exit, code) which puts `code` in a0 before the ecall. */
+    __ecall2(SYS_exit, code);
     for (;;) { }
 }
 
