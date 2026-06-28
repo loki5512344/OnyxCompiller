@@ -7,7 +7,7 @@
 #ifndef CC_PARSER_PRIV_H
 #define CC_PARSER_PRIV_H
 
-#include "cc.h"
+#include "core/cc.h"
 #include "lexer.h"
 
 /* Global current lexer — set by parse_translation_unit(). */

@@ -4,11 +4,11 @@
  * Instructions are emitted little-endian into g_text. Branches and
  * jumps use label-based fixups resolved at function end.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "lexer.h"
-#include "riscv64.h"
+#include "core/cc.h"
+#include "front/lexer.h"
+#include "arch/riscv64.h"
 
 /* ---- Fixup list ------------------------------------------------------ */
 static fixup_t *g_fixups_head = NULL;

@@ -18,16 +18,16 @@ CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -Wno-stringo
 LDFLAGS ?=
 
 ONYXCC_SRCS = \
-    src/main.c \
-    src/util.c \
-    src/lexer.c \
-    src/pp.c \
-    src/types.c \
-    src/ast.c \
-    src/parse.c \
-    src/gen.c \
-    src/riscv64.c \
-    src/emit.c
+    src/core/main.c \
+    src/core/util.c \
+    src/front/lexer.c \
+    src/back/pp.c \
+    src/core/types.c \
+    src/front/ast.c \
+    src/front/parse.c \
+    src/back/gen.c \
+    src/arch/riscv64.c \
+    src/back/emit.c
 
 ONYXCC_OBJS = $(ONYXCC_SRCS:.c=.o)
 
@@ -51,16 +51,16 @@ $(ONYXCC): $(ONYXCC_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -Iinclude -c -o $@ $<
+	$(CC) $(CFLAGS) -Iinclude -Iinclude/core -Iinclude/front -Iinclude/back -Iinclude/arch -Iinclude/sys -c -o $@ $<
 
 # Cross-compile onyxcc itself to RISC-V64 ELF (for OnyxOS).
 # Uses clang-19 + lld with a freestanding libc shim (src/shim.c).
 onyxcc-riscv: onyxcc.riscv.elf
 
-onyxcc.riscv.elf: $(ONYXCC_SRCS) src/shim.c linker_onyx.ld
+onyxcc.riscv.elf: $(ONYXCC_SRCS) src/core/shim.c linker_onyx.ld
 	$(CLANG) $(RISCV_FLAGS) \
 	-Wl,-T,linker_onyx.ld -Wl,--gc-sections -Wl,--strip-all -Wl,-n \
-	$(ONYXCC_SRCS) src/shim.c -o $@
+	$(ONYXCC_SRCS) src/core/shim.c -o $@
 	@ls -la $@
 	@echo "--- onyxcc.riscv.elf ready. Convert to .onx with: make onyxcc-onx"
 
@@ -81,7 +81,7 @@ libonyxc:
 
 # Build hello.onx using our onyxcc.
 hello: $(ONYXCC)
-	./$(ONYXCC) -v -I libonyxc/include -o tests/hello_full.onx tests/hello_full.c
+	./$(ONYXCC) -v -I libonyxc/include/core -I libonyxc/include/io -I libonyxc/include/ctype -o tests/hello_full.onx tests/hello_full.c
 
 # Dump .onx header for inspection.
 test: hello
@@ -98,4 +98,5 @@ all-targets: $(ONYXCC) hello onyxcc-onx
 	@echo "  Test program:   tests/hello_full.onx"
 
 clean:
-	rm -f $(ONYXCC) $(ONYXCC_OBJS) tests/*.onx onyxcc.riscv.elf onyxcc.onx
+	rm -f $(ONYXCC) $(ONYXCC_OBJS) src/core/*.o src/front/*.o src/back/*.o src/arch/*.o tests/*.onx onyxcc.riscv.elf onyxcc.onx
+	rm -rf cc/

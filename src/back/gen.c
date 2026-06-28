@@ -19,15 +19,15 @@
  * For brevity, only the C subset needed for typical userspace
  * programs is supported. C++ is layered on top in cpp.c.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "lexer.h"
-#include "types.h"
-#include "ast.h"
-#include "gen.h"
-#include "riscv64.h"
-#include "parser_priv.h"
+#include "core/cc.h"
+#include "front/lexer.h"
+#include "core/types.h"
+#include "front/ast.h"
+#include "back/gen.h"
+#include "arch/riscv64.h"
+#include "front/parser_priv.h"
 
 gen_func_t g_func;
 

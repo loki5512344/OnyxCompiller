@@ -7,7 +7,7 @@
  * live in stdio.c / stdlib.c / unistd.c and call into these.
  */
 #include "onyxc.h"
-#include "../../include/syscalls.h"
+#include "../../../include/sys/syscalls.h"
 
 /* ── Original v0.3 set (1–31) ─────────────────────────────────────────── */
 

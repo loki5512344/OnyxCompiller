@@ -8,8 +8,8 @@
 #ifndef CC_AST_H
 #define CC_AST_H
 
-#include "cc.h"
-#include "types.h"
+#include "core/cc.h"
+#include "core/types.h"
 #include "lexer.h"
 
 typedef enum {

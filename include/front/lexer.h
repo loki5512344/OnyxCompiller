@@ -4,7 +4,7 @@
 #ifndef CC_LEXER_H
 #define CC_LEXER_H
 
-#include "cc.h"
+#include "core/cc.h"
 
 typedef enum {
     T_EOF = 0,

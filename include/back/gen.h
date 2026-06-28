@@ -4,10 +4,10 @@
 #ifndef CC_GEN_H
 #define CC_GEN_H
 
-#include "cc.h"
-#include "ast.h"
-#include "types.h"
-#include "lexer.h"
+#include "core/cc.h"
+#include "front/ast.h"
+#include "core/types.h"
+#include "front/lexer.h"
 
 /* Codegen state for current function. */
 typedef struct {

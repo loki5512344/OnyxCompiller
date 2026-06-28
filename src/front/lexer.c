@@ -11,10 +11,10 @@
  *
  * The lexer is table-free and uses first-char dispatch for speed.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "lexer.h"
+#include "core/cc.h"
+#include "front/lexer.h"
 
 /* ---- Keyword table --------------------------------------------------- */
 typedef struct { const char *name; token_kind_t kind; } kw_entry_t;

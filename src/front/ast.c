@@ -1,10 +1,10 @@
 /*
  * ast.c — AST nodes and symbol table.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "ast.h"
+#include "core/cc.h"
+#include "front/ast.h"
 
 cc_arena_t g_ast_arena;
 cc_arena_t g_type_arena;

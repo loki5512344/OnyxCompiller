@@ -10,12 +10,12 @@
  * are skipped by tracking #if/#else/#endif nesting. Macros are expanded
  * with a single-pass substitution to keep code small.
  */
-#include "compat.h"
+#include "core/compat.h"
 #define _POSIX_C_SOURCE 200809L   /* for strdup */
 
 
-#include "cc.h"
-#include "pp.h"
+#include "core/cc.h"
+#include "back/pp.h"
 
 #define MAX_INCLUDES 16
 #define MAX_MACROS 512

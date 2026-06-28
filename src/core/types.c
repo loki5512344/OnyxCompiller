@@ -4,10 +4,10 @@
  * Type objects are arena-allocated; the parser never frees them.
  * Primitives are singletons, all derived types go through the arena.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "types.h"
+#include "core/cc.h"
+#include "core/types.h"
 
 type_t ty_void, ty_bool, ty_char, ty_schar, ty_uchar,
        ty_short, ty_ushort, ty_int, ty_uint,

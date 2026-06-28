@@ -19,7 +19,7 @@ CC      ?= gcc
 CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -O2 -g
 
 # Files that use inline asm (RISC-V only) — excluded from host-check.
-PORTABLE_SRCS = src/stdio.c src/stdlib.c src/string.c src/ctype.c
+PORTABLE_SRCS = src/io/stdio.c src/io/stdlib.c src/io/string.c src/ctype/ctype.c
 
 .PHONY: all clean
 
@@ -27,7 +27,7 @@ all: $(PORTABLE_SRCS:.c=.o)
 	@echo "host-check OK: portable libonyxc files compile on $(CC)."
 
 %.o: %.c
-	$(CC) $(CFLAGS) -Iinclude -c -o $@ $<
+	$(CC) $(CFLAGS) -Iinclude/core -Iinclude/io -Iinclude/ctype -c -o $@ $<
 
 clean:
-	rm -f *.o src/*.o
+	rm -f *.o src/core/*.o src/io/*.o src/ctype/*.o

@@ -20,16 +20,16 @@
  *   --dump-tokens print tokens after lex (debug)
  *   -h, --help    show usage
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "pp.h"
-#include "lexer.h"
-#include "types.h"
-#include "ast.h"
-#include "parse.h"
-#include "gen.h"
-#include "emit.h"
+#include "core/cc.h"
+#include "back/pp.h"
+#include "front/lexer.h"
+#include "core/types.h"
+#include "front/ast.h"
+#include "front/parse.h"
+#include "back/gen.h"
+#include "back/emit.h"
 
 static void usage(void) {
     fprintf(stderr,

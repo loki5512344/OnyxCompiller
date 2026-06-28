@@ -19,7 +19,7 @@
 #ifndef CC_RISCV64_H
 #define CC_RISCV64_H
 
-#include "cc.h"
+#include "core/cc.h"
 
 /* Integer register names — ABI convention. */
 #define RV_ZERO  0

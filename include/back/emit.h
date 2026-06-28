@@ -1,6 +1,6 @@
 #ifndef CC_EMIT_H
 #define CC_EMIT_H
-#include "cc.h"
+#include "core/cc.h"
 int onx_emit(const char *path,
              const cc_buf_t *text,
              const cc_buf_t *rodata,

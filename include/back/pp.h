@@ -12,7 +12,7 @@
 #ifndef CC_PP_H
 #define CC_PP_H
 
-#include "cc.h"
+#include "core/cc.h"
 
 /* Reads file `path` from disk and returns its contents; *out_len gets the
  * size. Returns NULL on error. */

@@ -18,9 +18,9 @@
  * The kernel allocates the user stack and heap itself; we must NOT emit
  * segments for them.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
+#include "core/cc.h"
 
 static void put_u32le(uint8_t *p, uint32_t v) {
     p[0] = v & 0xff;

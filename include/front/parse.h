@@ -4,7 +4,7 @@
 #ifndef CC_PARSE_H
 #define CC_PARSE_H
 
-#include "cc.h"
+#include "core/cc.h"
 #include "lexer.h"
 
 void parse_translation_unit(lexer_t *lx);

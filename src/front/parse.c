@@ -5,15 +5,15 @@
  * invokes gen_decl() to emit code. Functions get their body parsed
  * inside gen.c (gen_func_body) to keep parser/gen interleaving tight.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
-#include "lexer.h"
-#include "types.h"
-#include "ast.h"
-#include "parse.h"
-#include "gen.h"
-#include "parser_priv.h"
+#include "core/cc.h"
+#include "front/lexer.h"
+#include "core/types.h"
+#include "front/ast.h"
+#include "front/parse.h"
+#include "back/gen.h"
+#include "front/parser_priv.h"
 
 lexer_t *g_lx = NULL;
 

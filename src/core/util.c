@@ -1,9 +1,9 @@
 /*
  * util.c — diagnostics, arena, growable buffers, string pool.
  */
-#include "compat.h"
+#include "core/compat.h"
 
-#include "cc.h"
+#include "core/cc.h"
 
 cc_buf_t g_text;
 cc_buf_t g_rodata;
