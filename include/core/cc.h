@@ -35,7 +35,7 @@
 #define CC_MAX_DATA_BUF    (1u << 20)
 #define CC_MAX_BSS_SIZE    (1u << 22)   /* 4 MiB */
 
-#define CC_TEXT_VADDR  0x00010000uLL   /* must match OnyxKernel/init/linker.ld */
+#define CC_TEXT_VADDR  0x00010000uLL
 #define CC_RODATA_ALIGN 8u
 #define CC_DATA_ALIGN   8u
 #define CC_BSS_ALIGN    8u
@@ -59,10 +59,7 @@ int cc_get_warnings(void);
 #define cc_note(...)    cc_diag(CC_LVL_NOTE,  __FILE__, __LINE__, __VA_ARGS__)
 #define cc_warn(...)    cc_diag(CC_LVL_WARN,  __FILE__, __LINE__, __VA_ARGS__)
 #define cc_error(...)   cc_diag(CC_LVL_ERROR, __FILE__, __LINE__, __VA_ARGS__)
-#define cc_fatal(...)   do { \
-    cc_diag(CC_LVL_FATAL, __FILE__, __LINE__, __VA_ARGS__); \
-    __builtin_unreachable(); \
-} while (0)
+#define cc_fatal(...)   do { cc_diag(CC_LVL_FATAL, __FILE__, __LINE__, __VA_ARGS__); while (1) {} } while (0)
 
 /* ---- Lex/Parse positions ---------------------------------------------- */
 typedef struct {
@@ -115,10 +112,13 @@ extern uint64_t g_entry;     /* set by gen when _start is emitted */
 
 /* ---- CLI options ------------------------------------------------------ */
 typedef struct {
-    const char *input;
-    const char *output;     /* default: a.onx */
-    const char *entry_sym;  /* default: _start */
-    bool ring1;             /* emit ONX_FLAGS_RING1 */
+    const char *input;          /* primary input file (first one) */
+    const char *input_files[16]; /* all input files */
+    int n_input_files;
+    int current_file_idx;       /* index of file currently being compiled */
+    const char *output;         /* default: a.onx */
+    const char *entry_sym;      /* default: _start */
+    bool ring1;                 /* emit ONX_FLAGS_RING1 */
     bool verbose;
     bool dump_tokens;
     bool dump_ast;

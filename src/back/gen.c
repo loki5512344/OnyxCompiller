@@ -63,11 +63,38 @@ typedef struct {
 static val_t parse_assign(lexer_t *lx);
 static val_t parse_expr(lexer_t *lx);
 static void parse_stmt(lexer_t *lx);
+static void parse_stmt_body(lexer_t *lx);
 static val_t parse_primary(lexer_t *lx);
 static val_t parse_unary(lexer_t *lx);
+static long long parse_const_expr(lexer_t *lx);
 static void patch_jal(uint32_t off, int32_t delta);
 static void patch_sd_imm(uint32_t off, int32_t imm);
 static void parse_asm(lexer_t *lx);
+/* Forward declaration for brace initializer parsing. */
+static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type);
+static void gen_emit_local_braced_init(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int sym_idx);
+static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type);
+static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type);
+
+/* Forward declaration for static name mangling. */
+static void mangle_static_name(const char *name, char *out, size_t out_sz);
+
+/* Read one or more adjacent string literals and return a malloc'd buffer
+ * containing their concatenation.  The lexer is advanced past the last
+ * string literal; out_len receives the byte count (excluding NUL).
+ * Caller must free the returned pointer. */
+static char *parse_concat_string(lexer_t *lx, size_t *out_len) {
+    cc_buf_t buf;
+    cc_buf_init(&buf);
+    while (lx->cur.kind == T_STRING) {
+        cc_buf_push(&buf, lx->cur.str, lx->cur.str_len);
+        lex_next(lx);
+    }
+    cc_buf_push8(&buf, 0);
+    *out_len = buf.size - 1;
+    return (char *)buf.data;
+}
 
 /* ---- Label table for goto/label ------------------------------------- */
 #define MAX_LABELS 256
@@ -755,8 +782,10 @@ static val_t parse_primary(lexer_t *lx) {
         }
         case T_STRING: {
             /* Allocate in rodata; load address into T0 and return VAL_REG. */
-            uint32_t off = cc_strpool_add(lx->cur.str, lx->cur.str_len);
-            lex_next(lx);
+            size_t slen;
+            char *s = parse_concat_string(lx, &slen);
+            uint32_t off = cc_strpool_add(s, slen);
+            free(s);
             /* Emit lui+addi for rodata address; record fixup. */
             uint32_t lui_off = (uint32_t)g_text.size;
             rv_lui(RV_T0, 0);
@@ -909,7 +938,23 @@ static val_t parse_primary(lexer_t *lx) {
                     e.reg = RV_FT0;
                     return e;
                 }
-                /* int → int cast: truncate / extend */
+                /* int → int cast: truncate / extend.
+                 * For constant source values, preserve as immediate so that
+                 * global initializers like (void*)0 remain constant. */
+                if (e.kind == VAL_IMM && !src_float && !dst_float) {
+                    uint64_t mask = ~0ULL;
+                    uint64_t sz = type_sizeof(t);
+                    if (type_is_integer(t) && sz < 8) {
+                        mask = (1ULL << (sz * 8)) - 1;
+                        if (type_is_signed(t) && (e.imm & (1ULL << (sz * 8 - 1)))) {
+                            e.imm |= ~mask;
+                        } else {
+                            e.imm &= mask;
+                        }
+                    }
+                    e.type = t;
+                    return e;
+                }
                 load_value(&e, RV_T0);
                 if (type_is_integer(t) && type_sizeof(t) < 8) {
                     uint64_t sz = type_sizeof(t);
@@ -1062,6 +1107,13 @@ static val_t parse_primary(lexer_t *lx) {
                 }
 
                 int idx = symtab_lookup_global(name);
+                /* For multi-file compilation, also look up under the mangled
+                 * name (static symbols from this file). */
+                if (idx < 0 && g_opts.n_input_files > 1) {
+                    char mangled[CC_MAX_IDENT + 16];
+                    mangle_static_name(name, mangled, sizeof(mangled));
+                    idx = symtab_lookup_global(mangled);
+                }
                 if (idx >= 0 && g_globals[idx].kind == SYM_GLOBAL_VAR &&
                     g_globals[idx].type->kind == TY_PTR &&
                     g_globals[idx].type->base && g_globals[idx].type->base->kind == TY_FUNC) {
@@ -1098,6 +1150,12 @@ static val_t parse_primary(lexer_t *lx) {
                 v.type = g_locals[lidx].type;
             } else {
                 int gidx = symtab_lookup_global(name);
+                /* Try mangled name for static symbols from this file. */
+                if (gidx < 0 && g_opts.n_input_files > 1) {
+                    char mangled[CC_MAX_IDENT + 16];
+                    mangle_static_name(name, mangled, sizeof(mangled));
+                    gidx = symtab_lookup_global(mangled);
+                }
                 if (gidx >= 0) {
                     if (g_globals[gidx].kind == SYM_ENUM_CONST) {
                         v.kind = VAL_IMM;
@@ -1125,15 +1183,17 @@ static val_t parse_primary(lexer_t *lx) {
                     /* Compute address: base + idx * sizeof(*base). */
                     load_value(&v, RV_T0);
                     load_value(&idx, RV_T1);
+                    type_t *elem_type = NULL;
                     if (v.type->kind == TY_ARRAY) {
-                        uint64_t sz = type_sizeof(v.type->base);
+                        elem_type = v.type->base;
+                        uint64_t sz = type_sizeof(elem_type);
                         if (sz != 1) {
                             rv_addi_imm(RV_T2, RV_ZERO, sz);
                             rv_mul(RV_T1, RV_T1, RV_T2);
                         }
-                        v.type = type_make_ptr(v.type->base);
                     } else if (v.type->kind == TY_PTR) {
-                        uint64_t sz = type_sizeof(v.type->base);
+                        elem_type = v.type->base;
+                        uint64_t sz = type_sizeof(elem_type);
                         if (sz != 1) {
                             rv_addi_imm(RV_T2, RV_ZERO, sz);
                             rv_mul(RV_T1, RV_T1, RV_T2);
@@ -1141,6 +1201,7 @@ static val_t parse_primary(lexer_t *lx) {
                     }
                     rv_add(RV_T0, RV_T0, RV_T1);
                     v.kind = VAL_LVAL;
+                    v.type = elem_type;
                     v.reg = RV_T0;
                     v.offset = 0;
                     continue;
@@ -1806,10 +1867,13 @@ static val_t parse_assign(lexer_t *lx) {
 }
 
 static val_t parse_expr(lexer_t *lx) {
+    lexer_t *saved_g_lx = g_lx;
+    g_lx = lx;
     val_t v = parse_assign(lx);
     while (accept(T_COMMA)) {
         v = parse_assign(lx);
     }
+    g_lx = saved_g_lx;
     return v;
 }
 
@@ -1987,7 +2051,7 @@ static void parse_asm(lexer_t *lx) {
     }
 }
 
-static void parse_stmt(lexer_t *lx) {
+static void parse_stmt_body(lexer_t *lx) {
     cc_pos_t pos = lx->cur.pos;
 
     /* Label: identifier : */
@@ -2032,37 +2096,76 @@ static void parse_stmt(lexer_t *lx) {
             while (lx->cur.kind == T_LBRACKET) {
                 lex_next(lx);
                 uint64_t len = 0;
-                if (lx->cur.kind == T_INT || lx->cur.kind == T_LONG ||
-                    lx->cur.kind == T_UINT || lx->cur.kind == T_ULONG) {
-                    len = lx->cur.ival;
-                    lex_next(lx);
+                if (lx->cur.kind != T_RBRACKET) {
+                    len = (uint64_t)parse_const_expr(lx);
                 }
                 parse_expect(T_RBRACKET, "expected ']'");
                 t = type_make_array(t, len);
             }
-            /* Allocate stack slot. */
-            uint64_t sz = type_sizeof(t);
-            uint64_t al = type_alignof(t);
-            g_func.cur_offset += sz;
-            g_func.cur_offset = (g_func.cur_offset + al - 1) & ~(al - 1);
-            int64_t off = -(int64_t)g_func.cur_offset;
-            int idx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
-            g_locals[idx].offset = off;
-            if (g_func.cur_offset > g_func.frame_size) {
-                g_func.frame_size = g_func.cur_offset;
+            /* For incomplete array types, defer stack allocation so that
+             * brace initializer can complete the type first. */
+            bool deferred = false;
+            int64_t off = 0;
+            int idx = 0;
+
+            if (t->kind == TY_ARRAY && (t->length == 0 || t->is_incomplete) &&
+                lx->cur.kind == T_ASSIGN) {
+                deferred = true;
+            }
+
+            if (!deferred) {
+                uint64_t sz = type_sizeof(t);
+                uint64_t al = type_alignof(t);
+                g_func.cur_offset += sz;
+                g_func.cur_offset = (g_func.cur_offset + al - 1) & ~(al - 1);
+                off = -(int64_t)g_func.cur_offset;
+                idx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
+                g_locals[idx].offset = off;
+                if (g_func.cur_offset > g_func.frame_size) {
+                    g_func.frame_size = g_func.cur_offset;
+                }
             }
 
             /* Optional initializer. */
             if (accept(T_ASSIGN)) {
-                val_t init = parse_assign(lx);
-                /* Store into local. */
-                val_t lhs;
-                memset(&lhs, 0, sizeof(lhs));
-                lhs.kind = VAL_SYM;
-                lhs.sym_idx = g_n_globals + idx;
-                lhs.offset = 0;
-                lhs.type = t;
-                gen_store(&lhs, &init, T_ASSIGN);
+                if (lx->cur.kind == T_LBRACE) {
+                    if (deferred) {
+                        /* For incomplete arrays: parse brace init first to
+                         * determine the actual element count, then allocate. */
+                        uint64_t elem_count = gen_count_brace_elements(lx, t);
+                        /* Complete the array type from element count. */
+                        type_t *elem = t->base;
+                        uint64_t elem_sz = type_sizeof(elem);
+                        uint64_t total_bytes = elem_count * elem_sz;
+                        t->length = elem_count;
+                        t->is_incomplete = false;
+                        t->size = total_bytes;
+                        t->is_complete = true;
+                        uint64_t sz = type_sizeof(t);
+                        uint64_t al = type_alignof(t);
+                        g_func.cur_offset += sz;
+                        g_func.cur_offset = (g_func.cur_offset + al - 1) & ~(al - 1);
+                        off = -(int64_t)g_func.cur_offset;
+                        idx = symtab_install_local(name, SYM_LOCAL_VAR, t, g_cur_scope);
+                        g_locals[idx].offset = off;
+                        if (g_func.cur_offset > g_func.frame_size) {
+                            g_func.frame_size = g_func.cur_offset;
+                        }
+                        /* The lexer was restored to '{' by the counter. Parse again. */
+                        gen_emit_local_braced_init(lx, t, off, idx);
+                    } else {
+                        gen_emit_local_braced_init(lx, t, off, idx);
+                    }
+                } else {
+                    val_t init = parse_assign(lx);
+                    val_t lhs;
+                    memset(&lhs, 0, sizeof(lhs));
+                    lhs.kind = VAL_SYM;
+                    lhs.sym_idx = g_n_globals + idx;
+                    lhs.offset = 0;
+                    lhs.type = t;
+                    gen_store(&lhs, &init, T_ASSIGN);
+                }
             }
 
             if (accept(T_COMMA)) continue;
@@ -2116,6 +2219,41 @@ static void parse_stmt(lexer_t *lx) {
                       ((uint32_t)(d1 & 0x1E) << 7) | ((uint32_t)(d1 & 0x800) >> 4);
                 p1[0] = i1 & 0xff; p1[1] = (i1 >> 8) & 0xff; p1[2] = (i1 >> 16) & 0xff; p1[3] = (i1 >> 24) & 0xff;
             }
+            return;
+        }
+        case T_KW_DO: {
+            lex_next(lx);
+            uint32_t body_label = (uint32_t)g_text.size;
+            int saved_n_break = g_func.n_break_fixups;
+            int saved_n_cont = g_func.n_continue_fixups;
+            uint32_t saved_break = g_func.break_label;
+            uint32_t saved_continue = g_func.continue_label;
+            g_func.break_label = 0;
+            g_func.continue_label = 0;
+            g_func.loop_depth++;
+            parse_stmt(lx);
+            g_func.loop_depth--;
+            uint32_t cont_label = (uint32_t)g_text.size;
+            g_func.continue_label = cont_label;
+            parse_expect(T_KW_WHILE, "expected 'while'");
+            parse_expect(T_LPAREN, "expected '('");
+            val_t d_cond = parse_expr(lx);
+            parse_expect(T_RPAREN, "expected ')'");
+            parse_expect(T_SEMI, "expected ';'");
+            load_value(&d_cond, RV_T0);
+            rv_bne(RV_T0, RV_ZERO, 0);
+            uint32_t br_off = (uint32_t)g_text.size - 4;
+            uint32_t end_label = (uint32_t)g_text.size;
+
+            patch_branch(br_off, (int32_t)body_label - (int32_t)br_off);
+            for (int i = saved_n_break; i < g_func.n_break_fixups; i++)
+                patch_jal(g_func.break_fixups[i], (int32_t)end_label - (int32_t)g_func.break_fixups[i]);
+            for (int i = saved_n_cont; i < g_func.n_continue_fixups; i++)
+                patch_jal(g_func.continue_fixups[i], (int32_t)cont_label - (int32_t)g_func.continue_fixups[i]);
+            g_func.n_break_fixups = saved_n_break;
+            g_func.n_continue_fixups = saved_n_cont;
+            g_func.break_label = saved_break;
+            g_func.continue_label = saved_continue;
             return;
         }
         case T_KW_WHILE: {
@@ -2250,8 +2388,10 @@ static void parse_stmt(lexer_t *lx) {
             }
             uint32_t br_off = has_cond ? (uint32_t)g_text.size - 4 : 0;
 
-            /* Save post-expression source range, then skip it. */
-            size_t post_start_off = lx->pos;
+            /* Save post-expression source range, then skip it.
+             * Use token byte offsets rather than lx->pos because lx->pos may
+             * be ahead due to one-token lookahead. */
+            size_t post_start_off = lx->cur.src_off;
             int paren = 0;
             while (lx->cur.kind != T_RPAREN || paren > 0) {
                 if (lx->cur.kind == T_LPAREN) paren++;
@@ -2259,7 +2399,7 @@ static void parse_stmt(lexer_t *lx) {
                 else if (lx->cur.kind == T_EOF) break;
                 lex_next(lx);
             }
-            size_t post_end_off = lx->pos;
+            size_t post_end_off = lx->cur.src_off;
             parse_expect(T_RPAREN, "expected ')'");
 
             int saved_n_break = g_func.n_break_fixups;
@@ -2285,12 +2425,13 @@ static void parse_stmt(lexer_t *lx) {
                 lexer_t *saved_g_lx = g_lx;
                 lex_init(&post_lx, lx->src + post_start_off,
                          post_end_off - post_start_off, lx->filename);
-                lex_next(&post_lx);
+                /* lex_init already primes cur with the first token. */
                 g_lx = &post_lx;
                 val_t pv = parse_expr(&post_lx);
                 (void)pv;
                 g_lx = saved_g_lx;
             }
+
 
             rv_jal(RV_ZERO, 0);
             uint32_t jmp_off = (uint32_t)g_text.size - 4;
@@ -2367,6 +2508,13 @@ static void parse_stmt(lexer_t *lx) {
     }
 }
 
+static void parse_stmt(lexer_t *lx) {
+    lexer_t *saved_g_lx = g_lx;
+    g_lx = lx;
+    parse_stmt_body(lx);
+    g_lx = saved_g_lx;
+}
+
 static void parse_compound(lexer_t *lx) {
     parse_expect(T_LBRACE, "expected '{'");
     symtab_push_scope();
@@ -2377,18 +2525,128 @@ static void parse_compound(lexer_t *lx) {
     parse_expect(T_RBRACE, "expected '}'");
 }
 
+/* ---- Constant expression parser (for array sizes, etc.) ------------ */
+
+static int const_op_prec(token_kind_t k) {
+    switch (k) {
+        case T_OR: return 1;
+        case T_AND: return 2;
+        case T_PIPE: return 3;
+        case T_CARET: return 4;
+        case T_AMP: return 5;
+        case T_EQ: case T_NE: return 6;
+        case T_LT: case T_GT: case T_LE: case T_GE: return 7;
+        case T_SHL: case T_SHR: return 8;
+        case T_PLUS: case T_MINUS: return 9;
+        case T_STAR: case T_SLASH: case T_PERCENT: return 10;
+        default: return 0;
+    }
+}
+
+static long long const_expr_prim(lexer_t *lx);
+static long long const_expr_binop(lexer_t *lx, int min_prec);
+
+static long long const_expr_unary(lexer_t *lx) {
+    if (lx->cur.kind == T_PLUS) { lex_next(lx); return const_expr_unary(lx); }
+    if (lx->cur.kind == T_MINUS) { lex_next(lx); return -const_expr_unary(lx); }
+    if (lx->cur.kind == T_NOT) { lex_next(lx); return !const_expr_unary(lx); }
+    if (lx->cur.kind == T_TILDE) { lex_next(lx); return ~const_expr_unary(lx); }
+    if (lx->cur.kind == T_LPAREN) {
+        lex_next(lx);
+        long long v = const_expr_binop(lx, 0);
+        if (lx->cur.kind == T_RPAREN) lex_next(lx);
+        return v;
+    }
+    if (lx->cur.kind == T_INT || lx->cur.kind == T_LONG ||
+        lx->cur.kind == T_UINT || lx->cur.kind == T_ULONG) {
+        long long v = (long long)lx->cur.ival;
+        lex_next(lx);
+        return v;
+    }
+    if (lx->cur.kind == T_IDENT) {
+        int idx = symtab_lookup_global(lx->cur.text);
+        lex_next(lx);
+        if (idx >= 0 && g_globals[idx].kind == SYM_ENUM_CONST)
+            return (long long)g_globals[idx].enum_val;
+        return 0;
+    }
+    cc_error("expected constant expression");
+    return 0;
+}
+
+static long long const_expr_binop(lexer_t *lx, int min_prec) {
+    long long lhs = const_expr_unary(lx);
+    for (;;) {
+        int prec = const_op_prec(lx->cur.kind);
+        if (prec < min_prec || prec == 0) break;
+        token_kind_t op = lx->cur.kind;
+        lex_next(lx);
+        long long rhs = const_expr_binop(lx, prec + 1);
+        switch (op) {
+            case T_PLUS: lhs = lhs + rhs; break;
+            case T_MINUS: lhs = lhs - rhs; break;
+            case T_STAR: lhs = lhs * rhs; break;
+            case T_SLASH: lhs = rhs ? lhs / rhs : 0; break;
+            case T_PERCENT: lhs = rhs ? lhs % rhs : 0; break;
+            case T_SHL: lhs = lhs << rhs; break;
+            case T_SHR: lhs = lhs >> rhs; break;
+            case T_AMP: lhs = lhs & rhs; break;
+            case T_PIPE: lhs = lhs | rhs; break;
+            case T_CARET: lhs = lhs ^ rhs; break;
+            case T_AND: lhs = lhs && rhs; break;
+            case T_OR: lhs = lhs || rhs; break;
+            case T_EQ: lhs = (lhs == rhs); break;
+            case T_NE: lhs = (lhs != rhs); break;
+            case T_LT: lhs = (lhs < rhs); break;
+            case T_GT: lhs = (lhs > rhs); break;
+            case T_LE: lhs = (lhs <= rhs); break;
+            case T_GE: lhs = (lhs >= rhs); break;
+            default: break;
+        }
+    }
+    return lhs;
+}
+
+long long parse_const_expr(lexer_t *lx) {
+    return const_expr_binop(lx, 0);
+}
+
 /* ---- Global init parser (constant only) ---------------------------- */
 expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
     /* Support string literal initializers: char *s = "hello"; char s[] = "hello" */
-    if (lx->cur.kind == T_STRING) {
+    if (lx->cur.kind == T_STRING && type->kind != TY_STRUCT && type->kind != TY_UNION &&
+        !(type->kind == TY_ARRAY && (type->base->kind == TY_STRUCT || type->base->kind == TY_UNION))) {
         /* Add string to rodata pool. */
-        uint32_t off = cc_strpool_add(lx->cur.str, lx->cur.str_len);
-        size_t slen = lx->cur.str_len;  /* length without null terminator */
-        lex_next(lx);
+        size_t slen;
+        char *s = parse_concat_string(lx, &slen);
+        uint32_t off = cc_strpool_add(s, slen);
         /* Create an EX_STR node; ival holds the rodata offset, str_len the byte count. */
         expr_t *e = ast_new_expr(EX_STR, lx->cur.pos);
         e->ival = off;
         e->str_len = slen;
+        free(s);
+        return e;
+    }
+
+    /* Handle brace-enclosed initializer lists: { ... } */
+    if (lx->cur.kind == T_LBRACE) {
+        uint32_t start_off = (uint32_t)g_data.size;
+        gen_handle_braced_init_global(lx, type);
+
+        /* For incomplete arrays, compute element count from bytes written. */
+        if (type->kind == TY_ARRAY && (type->length == 0 || type->is_incomplete)) {
+            uint64_t elem_size = type_sizeof(type->base);
+            uint64_t total_bytes = g_data.size - start_off;
+            uint64_t n_elems = elem_size > 0 ? (total_bytes / elem_size) : 0;
+            type->length = n_elems;
+            type->is_incomplete = false;
+            type->size = total_bytes;
+            type->is_complete = true;
+        }
+
+        expr_t *e = ast_new_expr(EX_INIT_LIST, lx->cur.pos);
+        e->ival = start_off;
+        e->type = type;
         return e;
     }
 
@@ -2402,6 +2660,318 @@ expr_t *gen_parse_global_init(lexer_t *lx, type_t *type) {
         e->ival = 0;
     }
     return e;
+}
+
+/* ---- Brace initializer list parsing (global) ------------------------- */
+/* Recursively parse a brace-enclosed initializer list.
+ * Writes bytes directly to g_data.  Handles:
+ *   - Array initializers: int arr[] = {1,2,3};
+ *   - Struct initializers: struct S s = {field1, field2};
+ *   - Nested braces for aggregates-in-aggregates.
+ *   - String literals for pointer/char-array fields.
+ *   - Brace-elided sub-aggregate initializers.
+ * Returns the total number of bytes written to g_data for this level. */
+static uint64_t gen_handle_braced_init_global(lexer_t *lx, type_t *type) {
+    lex_next(lx); /* consume '{' */
+    uint64_t start_off = (uint64_t)g_data.size;
+    uint64_t elem_idx = 0;
+    bool first = true;
+
+    if (type->kind == TY_ARRAY) {
+        type_t *elem = type->base;
+        uint64_t elem_sz = type_sizeof(elem);
+        uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
+
+        while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF && elem_idx < max) {
+            if (!first) {
+                if (!accept(T_COMMA)) break;
+                if (lx->cur.kind == T_RBRACE) break;
+            }
+            first = false;
+
+            /* If element is aggregate and next token is '{', recurse */
+            if ((elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) &&
+                lx->cur.kind == T_LBRACE) {
+                gen_handle_braced_init_global(lx, elem);
+            } else if (elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) {
+                /* Brace-elided sub-aggregate initializer. */
+                gen_handle_braced_init_global(lx, elem);
+            } else {
+                gen_emit_global_init_scalar(lx, elem);
+            }
+            elem_idx++;
+        }
+
+        /* Pad remaining elements with zeros if array size is fixed. */
+        if (type->length > 0 && !type->is_incomplete) {
+            uint64_t total = type->length * elem_sz;
+            while ((uint64_t)(g_data.size - start_off) < total) {
+                cc_buf_push8(&g_data, 0);
+            }
+        }
+
+    } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
+        for (int i = 0; i < type->nfields; i++) {
+            struct_field_t *f = &type->fields[i];
+            if (f->is_anon) continue; /* skip anonymous fields for now */
+
+            if (!first) {
+                if (!accept(T_COMMA)) break;
+                if (lx->cur.kind == T_RBRACE) break;
+            }
+            first = false;
+
+            /* Emit padding to reach field offset. */
+            while ((uint64_t)(g_data.size - start_off) < f->offset) {
+                cc_buf_push8(&g_data, 0);
+            }
+
+            if ((f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) &&
+                lx->cur.kind == T_LBRACE) {
+                gen_handle_braced_init_global(lx, f->type);
+            } else if (f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) {
+                gen_handle_braced_init_global(lx, f->type);
+            } else {
+                gen_emit_global_init_scalar(lx, f->type);
+            }
+        }
+
+        /* Fill to struct/union total size. */
+        uint64_t total = type_sizeof(type);
+        while ((uint64_t)(g_data.size - start_off) < total) {
+            cc_buf_push8(&g_data, 0);
+        }
+
+    } else {
+        /* Scalar in braces: int x = {42}; */
+        gen_emit_global_init_scalar(lx, type);
+    }
+
+    parse_expect(T_RBRACE, "expected '}'");
+    return (uint64_t)(g_data.size - start_off);
+}
+
+/* ---- Brace element counting (for incomplete array sizing) ------------ */
+/* Count the number of top-level elements in a brace-enclosed initializer.
+ * This is a pure scan: the lexer position is saved and restored. */
+static uint64_t gen_count_brace_elements(lexer_t *lx, type_t *type) {
+    size_t saved_pos = lx->pos;
+    int saved_line = lx->line;
+    int saved_col = lx->col;
+    token_t saved_cur = lx->cur;
+    token_t saved_next = lx->next;
+    bool saved_has_next = lx->has_next;
+
+    uint64_t count = 0;
+    bool first = true;
+
+    if (lx->cur.kind != T_LBRACE) {
+        return 0;
+    }
+    lex_next(lx); /* consume '{' */
+
+    while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF) {
+        if (!first) {
+            if (lx->cur.kind != T_COMMA) break;
+            lex_next(lx);
+            if (lx->cur.kind == T_RBRACE) break;
+        }
+        first = false;
+
+        /* Skip one element, handling nested parentheses/braces/brackets.
+         * String and char literals are single tokens, so no special care needed. */
+        int depth = 0;
+        while (lx->cur.kind != T_EOF) {
+            if (lx->cur.kind == T_LPAREN || lx->cur.kind == T_LBRACKET || lx->cur.kind == T_LBRACE) {
+                depth++;
+            } else if (lx->cur.kind == T_RPAREN || lx->cur.kind == T_RBRACKET || lx->cur.kind == T_RBRACE) {
+                if (depth == 0) break;
+                depth--;
+            } else if (lx->cur.kind == T_COMMA && depth == 0) {
+                break;
+            }
+            lex_next(lx);
+        }
+        count++;
+    }
+
+    lx->pos = saved_pos;
+    lx->line = saved_line;
+    lx->col = saved_col;
+    lx->cur = saved_cur;
+    lx->next = saved_next;
+    lx->has_next = saved_has_next;
+    return count;
+}
+
+/* ---- Local brace initializer ----------------------------------------- */
+/* Emit store instructions for a brace-enclosed initializer of a local variable.
+ * `fp_off` is the fp-relative stack offset of the variable.
+ * `sym_idx` is the local symbol index. */
+static void gen_emit_local_braced_init(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int sym_idx);
+static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
+                                        int64_t fp_off, int64_t field_off);
+
+static void gen_emit_local_init_scalar(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int64_t field_off) {
+    if (lx->cur.kind == T_STRING) {
+        size_t slen;
+        char *s = parse_concat_string(lx, &slen);
+        uint32_t rodata_off = cc_strpool_add(s, slen);
+        free(s);
+        /* Load string address into T0 via lui+addi with rodata fixup. */
+        uint32_t lui_off = (uint32_t)g_text.size;
+        rv_lui(RV_T0, 0);
+        uint32_t addi_off = (uint32_t)g_text.size;
+        rv_addi(RV_T0, RV_T0, 0);
+        if (g_n_rodata_fixups >= 4096) cc_fatal("too many rodata fixups");
+        g_rodata_fixups[g_n_rodata_fixups].rodata_off = rodata_off;
+        g_rodata_fixups[g_n_rodata_fixups].patch_lui = lui_off;
+        g_rodata_fixups[g_n_rodata_fixups].patch_addi = addi_off;
+        g_n_rodata_fixups++;
+
+        /* Store the pointer to the stack slot. */
+        rv_sd(RV_T0, RV_FP, (int)(fp_off + field_off));
+        return;
+    }
+
+    /* Scalar: evaluate expression and store to stack slot. */
+    val_t v = parse_assign(lx);
+    int addr_reg = RV_T2;
+    load_value(&v, RV_T0);
+    uint64_t sz = type_sizeof(type);
+    /* Compute address: fp + fp_off + field_off. */
+    int total_off = (int)(fp_off + field_off);
+    rv_addi(addr_reg, RV_FP, total_off);
+    switch (sz) {
+        case 1: rv_sb(RV_T0, addr_reg, 0); break;
+        case 2: rv_sh(RV_T0, addr_reg, 0); break;
+        case 4: rv_sw(RV_T0, addr_reg, 0); break;
+        case 8: rv_sd(RV_T0, addr_reg, 0); break;
+        default: rv_sd(RV_T0, addr_reg, 0); break;
+    }
+}
+
+static void gen_emit_local_init_recurse(lexer_t *lx, type_t *type,
+                                        int64_t fp_off, int64_t field_off) {
+    if (type->kind == TY_ARRAY) {
+        type_t *elem = type->base;
+        uint64_t elem_sz = type_sizeof(elem);
+        uint64_t max = type->length > 0 ? type->length : UINT64_MAX;
+        uint64_t count = 0;
+        bool first_elem = true;
+
+        while (lx->cur.kind != T_RBRACE && lx->cur.kind != T_EOF && count < max) {
+            if (!first_elem) {
+                if (lx->cur.kind != T_COMMA) break;
+                lex_next(lx);
+                if (lx->cur.kind == T_RBRACE) break;
+            }
+            first_elem = false;
+
+            if ((elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) &&
+                lx->cur.kind == T_LBRACE) {
+                lex_next(lx);
+                gen_emit_local_init_recurse(lx, elem, fp_off, field_off + (int64_t)(count * elem_sz));
+                if (lx->cur.kind == T_RBRACE) lex_next(lx);
+                else parse_error("expected '}'");
+            } else if (elem->kind == TY_ARRAY || elem->kind == TY_STRUCT || elem->kind == TY_UNION) {
+                gen_emit_local_init_recurse(lx, elem, fp_off, field_off + (int64_t)(count * elem_sz));
+            } else {
+                gen_emit_local_init_scalar(lx, elem, fp_off, field_off + (int64_t)(count * elem_sz));
+            }
+            count++;
+        }
+    } else if (type->kind == TY_STRUCT || type->kind == TY_UNION) {
+        bool first_field = true;
+        for (int i = 0; i < type->nfields; i++) {
+            struct_field_t *f = &type->fields[i];
+            if (f->is_anon) continue;
+            if (!first_field) {
+                if (lx->cur.kind != T_COMMA) break;
+                lex_next(lx);
+                if (lx->cur.kind == T_RBRACE) break;
+            }
+            first_field = false;
+
+            if ((f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) &&
+                lx->cur.kind == T_LBRACE) {
+                lex_next(lx);
+                gen_emit_local_init_recurse(lx, f->type, fp_off,
+                                           field_off + (int64_t)f->offset);
+                if (lx->cur.kind == T_RBRACE) lex_next(lx);
+                else parse_error("expected '}'");
+            } else if (f->type->kind == TY_ARRAY || f->type->kind == TY_STRUCT || f->type->kind == TY_UNION) {
+                gen_emit_local_init_recurse(lx, f->type, fp_off,
+                                           field_off + (int64_t)f->offset);
+            } else {
+                gen_emit_local_init_scalar(lx, f->type, fp_off,
+                                          field_off + (int64_t)f->offset);
+            }
+        }
+    } else {
+        /* Scalar in braces: int x = {42}; */
+        gen_emit_local_init_scalar(lx, type, fp_off, field_off);
+    }
+}
+
+static void gen_emit_local_braced_init(lexer_t *lx, type_t *type,
+                                       int64_t fp_off, int sym_idx) {
+    (void)sym_idx;
+    lex_next(lx); /* consume '{' */
+    gen_emit_local_init_recurse(lx, type, fp_off, 0);
+    if (lx->cur.kind == T_COMMA) lex_next(lx); /* optional trailing comma */
+    if (lx->cur.kind == T_RBRACE) lex_next(lx);
+    else parse_error("expected '}'");
+}
+
+/* Emit a single scalar (or string) constant initializer for global scope.
+ * Writes the value bytes to g_data. */
+static void gen_emit_global_init_scalar(lexer_t *lx, type_t *type) {
+    if (lx->cur.kind == T_STRING) {
+        size_t raw_len;
+        char *s = parse_concat_string(lx, &raw_len);
+        uint32_t rodata_off = cc_strpool_add(s, raw_len);
+        size_t slen = raw_len + 1; /* include NUL */
+
+        if (type->kind == TY_PTR) {
+            /* char *field = "str" — write placeholder pointer, record fixup. */
+            uint32_t data_off = (uint32_t)g_data.size;
+            cc_buf_push64(&g_data, 0);
+            if (g_n_data_rodata_fixups >= 4096)
+                cc_fatal("too many data-rodata fixups");
+            g_data_rodata_fixups[g_n_data_rodata_fixups].rodata_off = rodata_off;
+            g_data_rodata_fixups[g_n_data_rodata_fixups].data_off = data_off;
+            g_n_data_rodata_fixups++;
+        } else if (type->kind == TY_ARRAY && type->base &&
+                   (type->base->kind == TY_CHAR || type->base->kind == TY_SCHAR || type->base->kind == TY_UCHAR)) {
+            /* char s[] = "str" — copy bytes. */
+            cc_buf_push(&g_data, g_rodata.data + rodata_off, slen);
+            /* Pad to array size if fixed. */
+            if (type->length > 0 && !type->is_incomplete) {
+                uint64_t sz = type_sizeof(type);
+                while (slen < sz) { cc_buf_push8(&g_data, 0); slen++; }
+            }
+        } else {
+            cc_error("string initializer for non-pointer/non-array type");
+        }
+        free(s);
+        return;
+    }
+
+    /* Scalar integer/pointer value. */
+    val_t v = parse_assign(lx);
+    uint64_t sz = type_sizeof(type);
+    uint64_t val = 0;
+    if (v.kind == VAL_IMM) {
+        val = v.imm;
+    } else {
+        cc_error("non-constant initializer element");
+    }
+    for (uint64_t i = 0; i < sz; i++) {
+        cc_buf_push8(&g_data, (uint8_t)(val >> (8 * i)));
+    }
 }
 
 /* ---- Function body codegen ----------------------------------------- */
@@ -2520,31 +3090,65 @@ void gen_init(void) {
     g_entry = 0;
 }
 
+void gen_reset_for_file(void) {
+    memset(&g_func, 0, sizeof(g_func));
+    label_clear();
+    symtab_reset_locals();
+    cc_arena_reset(&g_ast_arena);
+}
+
+/* Helper: mangle a static symbol name with per-file prefix. */
+static void mangle_static_name(const char *name, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "__f%d_%s", g_opts.current_file_idx, name);
+}
+
 void gen_decl(decl_t *d) {
+    char name[CC_MAX_IDENT];
+    strncpy(name, d->name, CC_MAX_IDENT - 1);
+    name[CC_MAX_IDENT - 1] = 0;
+
+    /* Mangle static symbol names with per-file prefix to avoid collisions
+     * when compiling multiple files into one binary. */
+    if (d->type->is_static && g_opts.n_input_files > 1) {
+        char mangled[CC_MAX_IDENT + 16];
+        mangle_static_name(name, mangled, sizeof(mangled));
+        strncpy(name, mangled, CC_MAX_IDENT - 1);
+        name[CC_MAX_IDENT - 1] = 0;
+    }
     switch (d->kind) {
         case D_TYPEDEF: {
-            symtab_install_global(d->name, SYM_TYPEDEF, d->type);
+            symtab_install_global(name, SYM_TYPEDEF, d->type);
             return;
         }
         case D_FUNC_DECL: {
-            int idx = symtab_install_global(d->name, SYM_FUNCTION, d->type);
+            int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
             g_globals[idx].is_defined = false;
             return;
         }
         case D_FUNC_DEF: {
-            int idx = symtab_install_global(d->name, SYM_FUNCTION, d->type);
+            int idx = symtab_install_global(name, SYM_FUNCTION, d->type);
             g_globals[idx].is_defined = true;
             g_globals[idx].text_off = (uint32_t)g_text.size;
-            if (strcmp(d->name, g_opts.entry_sym ? g_opts.entry_sym : "_start") == 0) {
+            if (strcmp(name, g_opts.entry_sym ? g_opts.entry_sym : "_start") == 0) {
                 g_entry = CC_TEXT_VADDR + g_text.size;
             }
             gen_func_body(g_lx, d);
             return;
         }
         case D_VAR: {
-            int idx = symtab_install_global(d->name, SYM_GLOBAL_VAR, d->type);
+            int idx = symtab_install_global(name, SYM_GLOBAL_VAR, d->type);
+            /* Extern declarations without initializer are pure references —
+             * don't allocate space; a definition elsewhere provides it. */
+            if (d->type->is_extern && !d->init) {
+                return;
+            }
             if (d->init) {
-                if (d->init->kind == EX_NUM) {
+                if (d->init->kind == EX_INIT_LIST) {
+                    /* Brace initializer list — already written to g_data by
+                     * gen_handle_braced_init_global().  Just record the offset. */
+                    g_globals[idx].is_defined = true;
+                    g_globals[idx].text_off = (uint32_t)d->init->ival;
+                } else if (d->init->kind == EX_NUM) {
                     /* Integer/pointer constant initializer. */
                     uint64_t v = d->init->ival;
                     g_globals[idx].is_defined = true;

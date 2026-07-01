@@ -37,6 +37,95 @@ bool accept(token_kind_t k) {
     return false;
 }
 
+/* ---- Constant expression evaluator (for array sizes, etc.) ---------- */
+
+static int const_op_prec(token_kind_t k) {
+    switch (k) {
+        case T_OR: return 1;
+        case T_AND: return 2;
+        case T_PIPE: return 3;
+        case T_CARET: return 4;
+        case T_AMP: return 5;
+        case T_EQ: case T_NE: return 6;
+        case T_LT: case T_GT: case T_LE: case T_GE: return 7;
+        case T_SHL: case T_SHR: return 8;
+        case T_PLUS: case T_MINUS: return 9;
+        case T_STAR: case T_SLASH: case T_PERCENT: return 10;
+        default: return 0;
+    }
+}
+
+static long long const_expr_prim(void);
+static long long const_expr_binop(int min_prec);
+
+static long long const_expr_unary(void) {
+    if (accept(T_PLUS)) return const_expr_unary();
+    if (accept(T_MINUS)) return -const_expr_unary();
+    if (accept(T_NOT)) return !const_expr_unary();
+    if (accept(T_TILDE)) return ~const_expr_unary();
+    if (accept(T_LPAREN)) {
+        long long v = const_expr_binop(0);
+        parse_expect(T_RPAREN, "expected ')'");
+        return v;
+    }
+    if (g_lx->cur.kind == T_INT || g_lx->cur.kind == T_LONG ||
+        g_lx->cur.kind == T_UINT || g_lx->cur.kind == T_ULONG) {
+        long long v = (long long)g_lx->cur.ival;
+        lex_next(g_lx);
+        return v;
+    }
+    if (g_lx->cur.kind == T_IDENT) {
+        /* Try enum constant lookup. */
+        int idx = symtab_lookup_global(g_lx->cur.text);
+        lex_next(g_lx);
+        if (idx >= 0 && g_globals[idx].kind == SYM_ENUM_CONST) {
+            return (long long)g_globals[idx].enum_val;
+        }
+        /* Otherwise treat as 0 and emit error? For array sizes this will
+         * likely lead to further errors; return 0 to keep parsing. */
+        return 0;
+    }
+    parse_error("expected constant expression");
+    return 0;
+}
+
+static long long const_expr_binop(int min_prec) {
+    long long lhs = const_expr_unary();
+    for (;;) {
+        int prec = const_op_prec(g_lx->cur.kind);
+        if (prec < min_prec || prec == 0) break;
+        token_kind_t op = g_lx->cur.kind;
+        lex_next(g_lx);
+        long long rhs = const_expr_binop(prec + 1);
+        switch (op) {
+            case T_PLUS: lhs = lhs + rhs; break;
+            case T_MINUS: lhs = lhs - rhs; break;
+            case T_STAR: lhs = lhs * rhs; break;
+            case T_SLASH: lhs = rhs ? lhs / rhs : 0; break;
+            case T_PERCENT: lhs = rhs ? lhs % rhs : 0; break;
+            case T_SHL: lhs = lhs << rhs; break;
+            case T_SHR: lhs = lhs >> rhs; break;
+            case T_AMP: lhs = lhs & rhs; break;
+            case T_PIPE: lhs = lhs | rhs; break;
+            case T_CARET: lhs = lhs ^ rhs; break;
+            case T_AND: lhs = lhs && rhs; break;
+            case T_OR: lhs = lhs || rhs; break;
+            case T_EQ: lhs = (lhs == rhs); break;
+            case T_NE: lhs = (lhs != rhs); break;
+            case T_LT: lhs = (lhs < rhs); break;
+            case T_GT: lhs = (lhs > rhs); break;
+            case T_LE: lhs = (lhs <= rhs); break;
+            case T_GE: lhs = (lhs >= rhs); break;
+            default: break;
+        }
+    }
+    return lhs;
+}
+
+long long parse_const_expr(void) {
+    return const_expr_binop(0);
+}
+
 /* Skip __attribute__((...)) or asm(...). No-op if current token is not
  * an identifier matching those names. */
 void skip_attributes(void) {
@@ -117,7 +206,11 @@ static void parse_top_level(void) {
                         break;
                     }
                     type_t *ptyp = pbase;
-                    while (accept(T_STAR)) ptyp = type_make_ptr(ptyp);
+                    while (accept(T_STAR)) {
+                        ptyp = type_make_ptr(ptyp);
+                        /* Qualifiers between/after pointer stars: const char *const *p */
+                        while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
+                    }
                     char pname[CC_MAX_IDENT] = {0};
                     /* Parameter name is optional in prototypes. */
                     if (g_lx->cur.kind == T_IDENT) {
@@ -126,6 +219,18 @@ static void parse_top_level(void) {
                         /* (For MVP we accept any ident as the name.) */
                         lex_next(g_lx);
                     }
+                    /* Array declarator after name: argv[] */
+                    while (g_lx->cur.kind == T_LBRACKET) {
+                        lex_next(g_lx);
+                        uint64_t len = 0;
+                        if (g_lx->cur.kind != T_RBRACKET) {
+                            len = (uint64_t)parse_const_expr();
+                        }
+                        parse_expect(T_RBRACKET, "expected ']'");
+                        ptyp = type_make_array(ptyp, len);
+                    }
+                    /* Qualifiers may also appear after array declarator. */
+                    while (accept(T_KW_CONST) || accept(T_KW_VOLATILE)) { }
                     /* Array param decays to pointer. */
                     if (ptyp->kind == TY_ARRAY) ptyp = type_decay(ptyp);
                     if (ptyp->kind == TY_FUNC)  ptyp = type_make_ptr(ptyp);
@@ -162,16 +267,15 @@ static void parse_top_level(void) {
                 decl_t *d = ast_new_decl(D_FUNC_DECL, pos);
                 d->type = ftype;
                 strncpy(d->name, name, CC_MAX_IDENT - 1);
+                if (is_static) ftype->is_static = true;
                 gen_decl(d);
             }
         } else {
             while (g_lx->cur.kind == T_LBRACKET) {
                 lex_next(g_lx);
                 uint64_t len = 0;
-                if (g_lx->cur.kind == T_INT || g_lx->cur.kind == T_LONG ||
-                    g_lx->cur.kind == T_UINT || g_lx->cur.kind == T_ULONG) {
-                    len = g_lx->cur.ival;
-                    lex_next(g_lx);
+                if (g_lx->cur.kind != T_RBRACKET) {
+                    len = (uint64_t)parse_const_expr();
                 }
                 parse_expect(T_RBRACKET, "expected ']'");
                 t = type_make_array(t, len);

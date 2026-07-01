@@ -130,3 +130,10 @@ void symtab_enter_function(type_t *ftype) {
 void symtab_leave_function(void) {
     /* Nothing for now; could check unused here. */
 }
+
+void symtab_reset_locals(void) {
+    g_n_locals = 0;
+    g_cur_scope = 0;
+    g_scope_depth = 0;
+    g_scope_stack[0] = 0;
+}

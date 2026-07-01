@@ -151,22 +151,19 @@ static bool expand_one(const char **p, char *out, size_t *outlen, size_t outcap)
     return true;
 }
 
-/* Expand macros in a logical line. Result is written back into `line`
- * (in place; assumes expansion does not grow the line significantly).
- * Returns the new length. */
-static size_t expand_macros(char *line, size_t len) {
-    static char out[8192];
+/* Expand one pass over a logical line. Helper for expand_macros. */
+static size_t expand_macros_one_pass(const char *in, size_t inlen, char *out, size_t outcap) {
     size_t outlen = 0;
-    const char *p = line;
-    const char *end = line + len;
+    const char *p = in;
+    const char *end = in + inlen;
     while (p < end) {
         int c = (unsigned char)*p;
         if (is_ident_start(c)) {
-            if (!expand_one(&p, out, &outlen, sizeof(out) - 1)) {
+            if (!expand_one(&p, out, &outlen, outcap)) {
                 /* No expansion — copy identifier verbatim. */
                 size_t nl = 0;
                 while (p + nl < end && is_ident_char(p[nl])) nl++;
-                if (outlen + nl < sizeof(out) - 1) {
+                if (outlen + nl < outcap) {
                     memcpy(out + outlen, p, nl);
                     outlen += nl;
                 }
@@ -174,40 +171,70 @@ static size_t expand_macros(char *line, size_t len) {
             }
         } else if (c == '"') {
             /* Skip string literal verbatim. */
-            out[outlen++] = *p++;
+            if (outlen < outcap) out[outlen++] = *p++;
+            else p++;
             while (p < end && *p != '"') {
                 if (*p == '\\' && p + 1 < end) {
-                    out[outlen++] = *p++;
-                    if (outlen < sizeof(out) - 1) out[outlen++] = *p++;
-                } else if (outlen < sizeof(out) - 1) {
+                    if (outlen < outcap) out[outlen++] = *p++;
+                    else p++;
+                    if (outlen < outcap) out[outlen++] = *p++;
+                    else p++;
+                } else if (outlen < outcap) {
                     out[outlen++] = *p++;
                 } else { p++; }
             }
-            if (p < end && outlen < sizeof(out) - 1) out[outlen++] = *p++;
+            if (p < end && outlen < outcap) out[outlen++] = *p++;
         } else if (c == '\'') {
-            out[outlen++] = *p++;
+            if (outlen < outcap) out[outlen++] = *p++;
+            else p++;
             while (p < end && *p != '\'') {
                 if (*p == '\\' && p + 1 < end) {
-                    out[outlen++] = *p++;
-                    if (outlen < sizeof(out) - 1) out[outlen++] = *p++;
-                } else if (outlen < sizeof(out) - 1) {
+                    if (outlen < outcap) out[outlen++] = *p++;
+                    else p++;
+                    if (outlen < outcap) out[outlen++] = *p++;
+                    else p++;
+                } else if (outlen < outcap) {
                     out[outlen++] = *p++;
                 } else { p++; }
             }
-            if (p < end && outlen < sizeof(out) - 1) out[outlen++] = *p++;
+            if (p < end && outlen < outcap) out[outlen++] = *p++;
         } else {
-            if (outlen < sizeof(out) - 1) out[outlen++] = *p++;
+            if (outlen < outcap) out[outlen++] = *p++;
             else p++;
         }
     }
     out[outlen] = 0;
-    if (outlen > len) {
-        /* Shouldn't happen often; bail to caller. */
-        memcpy(line, out, len);
-        return len;
-    }
-    memcpy(line, out, outlen);
     return outlen;
+}
+
+/* Expand macros in a logical line. Result is written back into `line`
+ * (in place; assumes expansion does not grow the line significantly).
+ * Performs multiple passes to handle chained macro expansions like
+ *   #define A B
+ *   #define B 1
+ * Returns the new length. */
+static size_t expand_macros(char *line, size_t len, size_t cap) {
+    static char tmp1[8192];
+    static char tmp2[8192];
+    char *cur = tmp1;
+    char *next = tmp2;
+    size_t curlen = len;
+    memcpy(cur, line, len);
+    cur[len] = 0;
+    for (int pass = 0; pass < 16; pass++) {
+        size_t nextlen = expand_macros_one_pass(cur, curlen, next, sizeof(tmp2) - 1);
+        if (nextlen == curlen && memcmp(cur, next, curlen) == 0) {
+            /* No change — stable. */
+            break;
+        }
+        char *swap = cur; cur = next; next = swap;
+        curlen = nextlen;
+        if (curlen >= sizeof(tmp1) - 1) break;
+    }
+    if (curlen >= cap) curlen = cap - 1;
+    memcpy(line, cur, curlen);
+    line[curlen] = 0;
+    return curlen;
 }
 
 /* Find include file. Returns malloc'd full path or NULL. */
@@ -428,7 +455,7 @@ static void handle_directive(const char *line, size_t llen, const char *filename
         if (restlen >= sizeof(exprbuf)) restlen = sizeof(exprbuf) - 1;
         memcpy(exprbuf, rest, restlen);
         exprbuf[restlen] = 0;
-        size_t el = expand_macros(exprbuf, restlen);
+        size_t el = expand_macros(exprbuf, restlen, sizeof(exprbuf));
         long v = eval_const_expr(exprbuf);
         (void)el;
         bool taken = (v != 0);
@@ -449,7 +476,7 @@ static void handle_directive(const char *line, size_t llen, const char *filename
             if (restlen >= sizeof(exprbuf)) restlen = sizeof(exprbuf) - 1;
             memcpy(exprbuf, rest, restlen);
             exprbuf[restlen] = 0;
-            expand_macros(exprbuf, restlen);
+            expand_macros(exprbuf, restlen, sizeof(exprbuf));
             long v = eval_const_expr(exprbuf);
             if (v != 0) {
                 g_if_stack[g_if_depth - 1] = 1;
@@ -710,7 +737,7 @@ static void process_source(const char *src, size_t len, const char *filename) {
             if (qlen < sizeof(linebuf)) {
                 memcpy(linebuf, q, qlen);
                 linebuf[qlen] = 0;
-                size_t nl = expand_macros(linebuf, qlen);
+                size_t nl = expand_macros(linebuf, qlen, sizeof(linebuf));
                 out_emit(linebuf, nl);
             } else {
                 out_emit(q, qlen);

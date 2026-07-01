@@ -33,6 +33,9 @@ extern gen_func_t g_func;
 /* Initialize codegen. */
 void gen_init(void);
 
+/* Reset per-file state (keeps globals, segments, fixups). */
+void gen_reset_for_file(void);
+
 /* Generate one top-level declaration. */
 void gen_decl(decl_t *d);
 

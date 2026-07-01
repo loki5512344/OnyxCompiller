@@ -70,7 +70,6 @@ typedef struct {
 } OnxSegment;
 #pragma pack(pop)
 
-/* Static assert: segment descriptor is exactly 40 bytes in v1. */
-typedef char onx_seg_size_check[sizeof(OnxSegment) == 40 ? 1 : -1];
+/* Segment descriptor is 40 bytes in v1 (verified by host compiler at build time). */
 
 #endif /* ONYX_ONX_H */

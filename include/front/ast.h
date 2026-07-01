@@ -194,6 +194,9 @@ int symtab_install_local(const char *name, sym_kind_t kind, type_t *type, int sc
 void symtab_push_scope(void);
 void symtab_pop_scope(void);
 
+/* Reset local symbol table (keeps globals intact). */
+void symtab_reset_locals(void);
+
 void symtab_enter_function(type_t *ftype);
 void symtab_leave_function(void);
 

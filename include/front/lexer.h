@@ -54,6 +54,8 @@ typedef enum {
 typedef struct {
     token_kind_t kind;
     cc_pos_t pos;
+    /* Byte offset in lx->src where this token starts. */
+    size_t src_off;
     /* For literals and identifiers */
     char text[CC_MAX_TOKEN_LEN];
     /* For integer literals: parsed value */

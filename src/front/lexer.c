@@ -390,6 +390,7 @@ static void lex_ident(lexer_t *lx, token_t *t) {
 static void lex_one(lexer_t *lx, token_t *t) {
     memset(t, 0, sizeof(*t));
     skip_ws(lx);
+    t->src_off = lx->pos;
     t->pos.file = lx->filename;
     t->pos.line = lx->line;
     t->pos.col = lx->col;

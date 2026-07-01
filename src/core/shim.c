@@ -33,54 +33,31 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-static inline long _ecall1(long n) {
-    register long a0 __asm__("a0");
-    register long a7 __asm__("a7") = n;
-    __asm__ volatile ("ecall" : "=r"(a0) : "r"(a7) : "memory");
-    return a0;
-}
-
-static inline long _ecall3(long n, long a, long b, long c) {
-    register long a0 __asm__("a0") = a;
-    register long a1 __asm__("a1") = b;
-    register long a2 __asm__("a2") = c;
-    register long a7 __asm__("a7") = n;
-    __asm__ volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
-    return a0;
-}
-
 static long _write(int fd, const void *buf, unsigned long n) {
-    return _ecall3(SYS_write, fd, (long)buf, n);
+    return __ecall3(SYS_write, fd, (long)buf, n);
 }
 
 static long _read(int fd, void *buf, unsigned long n) {
-    return _ecall3(SYS_read, fd, (long)buf, n);
+    return __ecall3(SYS_read, fd, (long)buf, n);
 }
 
 static void _exit(int code) {
-    _ecall1(SYS_exit);
-    for (;;) { __asm__ volatile ("wfi"); }
+    __ecall1(SYS_exit, code);
+    for (;;) { }
 }
 
 static long _open(const char *path, int flags) {
     /* OnyxOS SYS_open(path, flags, mode) — we use flags=0 (read). */
-    register long a0 __asm__("a0") = (long)path;
-    register long a1 __asm__("a1") = 0;
-    register long a2 __asm__("a2") = 0;
-    register long a7 __asm__("a7") = SYS_open;
-    __asm__ volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
-    return a0;
+    (void)flags;
+    return __ecall3(SYS_open, (long)path, 0, 0);
 }
 
 static long _close(int fd) {
-    register long a0 __asm__("a0") = fd;
-    register long a7 __asm__("a7") = SYS_close;
-    __asm__ volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
-    return a0;
+    return __ecall1(SYS_close, fd);
 }
 
 static long _lseek(int fd, long off, int whence) {
-    return _ecall3(SYS_lseek, fd, off, whence);
+    return __ecall3(SYS_lseek, fd, off, whence);
 }
 
 /* ---- Heap (sbrk-based) ---- */
@@ -89,10 +66,8 @@ static char *_heap_end = NULL;
 
 static void _heap_init(void) {
     if (!_heap) {
-        register long a0 __asm__("a0") = 0;
-        register long a7 __asm__("a7") = SYS_sbrk;
-        __asm__ volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
-        _heap = (char *)a0;
+        long base = __ecall1(SYS_sbrk, 0);
+        _heap = (char *)base;
         _heap_end = _heap;
     }
 }
@@ -103,10 +78,8 @@ void *malloc(unsigned long n) {
     if (_heap + n > _heap_end) {
         long inc = (long)(n - (_heap_end - _heap));
         inc = (inc + 0xFFFF) & ~0xFFFFL;
-        register long a0 __asm__("a0") = inc;
-        register long a7 __asm__("a7") = SYS_sbrk;
-        __asm__ volatile ("ecall" : "+r"(a0) : "r"(a7) : "memory");
-        if ((long)a0 < 0) return NULL;
+        long r = __ecall1(SYS_sbrk, inc);
+        if ((long)r < 0) return NULL;
         _heap_end += inc;
     }
     void *p = _heap;
@@ -244,30 +217,35 @@ void *memchr(const void *s, int c, unsigned long n) {
 /* OnyxCC uses __ctype_b_loc and __ctype_tolower_loc. We provide a small
  * table-based implementation. */
 static const unsigned short _ctype_table[256] = {
-    ['A']=0x103,['B']=0x103,['C']=0x103,['D']=0x103,['E']=0x103,['F']=0x103,
-    ['G']=0x103,['H']=0x103,['I']=0x103,['J']=0x103,['K']=0x103,['L']=0x103,
-    ['M']=0x103,['N']=0x103,['O']=0x103,['P']=0x103,['Q']=0x103,['R']=0x103,
-    ['S']=0x103,['T']=0x103,['U']=0x103,['V']=0x103,['W']=0x103,['X']=0x103,
-    ['Y']=0x103,['Z']=0x103,
-    ['a']=0x183,['b']=0x183,['c']=0x183,['d']=0x183,['e']=0x183,['f']=0x183,
-    ['g']=0x183,['h']=0x183,['i']=0x183,['j']=0x183,['k']=0x183,['l']=0x183,
-    ['m']=0x183,['n']=0x183,['o']=0x183,['p']=0x183,['q']=0x183,['r']=0x183,
-    ['s']=0x183,['t']=0x183,['u']=0x183,['v']=0x183,['w']=0x183,['x']=0x183,
-    ['y']=0x183,['z']=0x183,
-    ['0']=0x583,['1']=0x583,['2']=0x583,['3']=0x583,['4']=0x583,
-    ['5']=0x583,['6']=0x583,['7']=0x583,['8']=0x583,['9']=0x583,
-    [' ']=0x20,['\t']=0x20,['\n']=0x20,['\r']=0x20,['\v']=0x20,['\f']=0x20,
+    0,0,0,0,0,0,0,0,0,0x20,0x20,0x20,0x20,0x20,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0x20,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0x583,0x583,0x583,0x583,0x583,0x583,0x583,0x583,0x583,0x583,0,0,0,0,0,0,
+    0,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,
+    0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0x103,0,0,0,0,0,
+    0,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,
+    0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0x183,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 
-const unsigned short *const _ctype_ptr = _ctype_table;
+const unsigned short *_ctype_ptr;
 unsigned short **__ctype_b_loc(void) {
+    if (!_ctype_ptr) _ctype_ptr = _ctype_table;
     return (unsigned short **)&_ctype_ptr;
 }
 
 static int _tolower_table[256];
 static int _tolower_init = 0;
-static int *const _tolower_ptr = _tolower_table;
+static int *_tolower_ptr;
 int **__ctype_tolower_loc(void) {
+    if (!_tolower_ptr) _tolower_ptr = _tolower_table;
     if (!_tolower_init) {
         for (int i = 0; i < 256; i++) _tolower_table[i] = i;
         for (int i = 'A'; i <= 'Z'; i++) _tolower_table[i] = i + 32;
@@ -299,9 +277,9 @@ static int _fd_used[MAX_FDS];
 typedef struct { int fd; } FILE;
 
 static FILE _stderr_obj = { 2 };
-FILE *stderr = &_stderr_obj;
+FILE *stderr;
 static FILE _stdout_obj = { 1 };
-FILE *stdout = &_stdout_obj;
+FILE *stdout;
 
 FILE *fopen(const char *path, const char *mode) {
     int fd = (int)_open(path, 0);
@@ -410,11 +388,12 @@ static int _vfmt(char *buf, int cap, const char *fmt, va_list ap) {
             }
             case 'p': {
                 unsigned long v = (unsigned long)(unsigned long)va_arg(ap, void *);
+                const char *set = "0123456789abcdef";
                 if (p < cap - 1) buf[p++] = '0';
                 if (p < cap - 1) buf[p++] = 'x';
                 char tmp[24];
                 int n = 0;
-                while (v > 0) { tmp[n++] = "0123456789abcdef"[v & 0xF]; v >>= 4; }
+                while (v > 0) { tmp[n++] = set[v & 0xF]; v >>= 4; }
                 if (n == 0) tmp[n++] = '0';
                 while (n > 0 && p < cap - 1) buf[p++] = tmp[--n];
                 break;
@@ -565,13 +544,11 @@ extern int main(int argc, char **argv);
 
 /* Read argc (a0) and argv (a1) from RISC-V calling convention.
  * If argc == 0 (kernel didn't pass args), default to argc=1, argv={"onyxcc"} */
-void _start(void) {
-    int argc;
-    char **argv;
-    __asm__("mv %0, a0" : "=r"(argc));
-    __asm__("mv %0, a1" : "=r"(argv));
+void _start(int argc, char **argv) {
+    stderr = &_stderr_obj;
+    stdout = &_stdout_obj;
     if (argc == 0) {
-        static char progname[] = "onyxcc";
+        static char *progname = "onyxcc";
         static char *default_argv[] = { NULL, NULL };
         default_argv[0] = progname;
         argc = 1;
